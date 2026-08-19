@@ -27,8 +27,8 @@ pub struct BomValidationConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Allow machines that do not have a SKU assigned to bypass SKU validation
-    /// When true, machines in WaitingForSkuAssignment state can proceed without a SKU
+    /// Allow machines without an assigned SKU to bypass BOM validation.
+    /// When true, a machine that remains unassigned can proceed without a SKU.
     #[serde(default)]
     pub ignore_unassigned_machines: bool,
 

@@ -5,7 +5,7 @@ NVIDIA Infra Controller (NICo) supports checking and validating the hardware in 
 ## Summary
 
 A SKU is a collection of definitions managed by NICo that define a specific configuration of machine.
-Each host managed by NICo must have a SKU associated with it before it can be made available for use by a tenant.
+Each host managed by NICo normally has a SKU associated with it before it can be made available for use by a tenant.
 
 {/* TODO: did we actually implement this? */}
 
@@ -16,9 +16,9 @@ Machines that are assigned a SKU are automatically validated during ingestion ba
 Hardware validation occurs during initial ingestion and after an instance is released and new discovery information is received.
 
 New machines are automatically checked against existing SKUs and if a match is found, the machine passes
-SKU validation and continues with the normal ingestion process.  If no match is found the machine waits until
-a matching SKU is available or until the machine is made compatible with an existing SKU, if SKU validation is enabled
-in the site (`ignore_unassigned_machines` configuration option).
+SKU validation and continues with the normal ingestion process. If no match is found, the machine normally waits until
+a matching SKU is available or the machine is made compatible with an existing SKU. When
+`ignore_unassigned_machines` is enabled, an unassigned machine can instead proceed without waiting for SKU assignment.
 
 ## Behavior
 
@@ -74,12 +74,14 @@ auto_generate_missing_sku_interval = "300s"
   allocation blockage due to SKU validation issues when you only need logging without health report alerts. This option does
   not bypass a machine without an assigned SKU; with `ignore_unassigned_machines = false`, that machine waits for SKU
   assignment.
- - `ignore_unassigned_machines` - When true and BOM validation encounters a machine that does not have an associated SKU,
-  it will proceed as if all validation has passed. Only machines with an associated SKU will be validated. This allows
-  existing sites to be upgraded and BOM Validation enabled as SKUs are added to the system without impacting site operation.
-  Machines that do not have an assigned SKU will still be usable and assignable.
- - `find_match_interval` - determines how often NICo will attempt to find a matching SKU for a machine.  NICo will only
-  attempt to find a SKU when the machine is in the `Ready` state.
+ - `ignore_unassigned_machines` - When true, BOM validation is skipped for a machine without an assigned SKU, allowing it
+  to proceed without hardware validation or waiting for SKU assignment. During initial ingestion and while waiting for
+  assignment, NICo attempts to match eligible machines to existing SKUs; a machine that receives a SKU is validated.
+  This allows existing sites to be upgraded and BOM Validation enabled as SKUs are added to the system without impacting
+  site operation. Machines without an assigned SKU can still be usable and assignable.
+ - `find_match_interval` - determines how often NICo retries finding a matching SKU for an unassigned machine. NICo
+  attempts a match when an unassigned machine is handled in `Ready` or in the `MatchingSku` or
+  `WaitingForSkuAssignment` BOM validation states.
  - `auto_generate_missing_sku` - enable or disable generation of a SKU from a machine.  This only applies to a machine with a SKU
   specified in the expected machine configuration and in the `SkuMissing` state.
  - `auto_generate_missing_sku_interval` - determines how often NICo will attempt to generate a sku from the machine data.
