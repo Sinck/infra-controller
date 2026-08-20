@@ -32,10 +32,15 @@ pub struct BomValidationConfig {
     #[serde(default)]
     pub ignore_unassigned_machines: bool,
 
-    /// Allow machines with assigned SKUs to stay in Ready state and remain allocatable even when SKU validation fails
-    /// When false (default): Standard mode - validation failures block allocation (machine enters failed state)
-    /// When true: Allow allocation mode - validation still occurs and health reports are recorded, but machines do not transition
-    /// into failed states (SkuVerificationFailed, SkuMissing) and can proceed to Ready/MachineValidation
+    /// Allow machines with assigned SKUs to proceed when SKU validation fails.
+    /// A missing SKU found during verification enters SkuMissing and records a health report.
+    ///
+    /// When false (default), validation failures block allocation by entering failed states.
+    ///
+    /// When true, a Ready machine whose assigned SKU is missing stays Ready. A SKU mismatch is logged, but the
+    /// machine proceeds without recording a SKU validation health report. On a later reconciliation, a machine with
+    /// an assigned SKU in SkuMissing or SkuVerificationFailed can leave BOM validation, clearing that report and
+    /// resuming normal lifecycle processing.
     /// This does not bypass machines without an assigned SKU; use ignore_unassigned_machines for that.
     #[serde(default)]
     pub allow_allocation_on_validation_failure: bool,

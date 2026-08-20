@@ -42,9 +42,9 @@ Verifying a SKU against a machine goes through several steps to acquire updated 
 - `MatchingSku` - The state machine will attempt to find an existing SKU that matches the machine inventory.
 - `UpdatingInventory` - NICo is requesting that scout re-inventory the machine.  This ensures that other operations are using a recent version of the machine inventory
 - `VerifyingSku` - NICo is comparing the machine inventory against the SKU
-- `SkuVerificationFailed` - The machine did not match the SKU.  Manual intervention is required.  The `sku verify` command may be used to retry the verification
+- `SkuVerificationFailed` - The machine did not match the SKU. Manual intervention is required unless `allow_allocation_on_validation_failure` is enabled, in which case the machine can proceed on a later reconciliation. The `sku verify` command may be used to retry the verification.
 - `WaitingForSkuAssignment` - The machine does not have a SKU assigned and the configuration requires one.
-- `SkuMissing` - The machine has a SKU assigned, but the SKU does not exist.  This happens when a SKU is specified in the expected machines, but was not created.  If configured, NICo will attempt to generate a SKU
+- `SkuMissing` - The machine has a SKU assigned, but the SKU does not exist. This happens when a SKU is specified in the expected machines, but was not created. If configured, NICo will attempt to generate a SKU. When `allow_allocation_on_validation_failure` is enabled, the machine can proceed on a later reconciliation.
 
 ### Versions
 NICo maintains a version of the SKU schema used when a SKU is created.  This ensures that the same comparison is used during the lifetime of a SKU and ensures that the behavior of BOM validation does not change between NICo versions.  When new components are added, or new data sources are used during validation, existing SKUs will not be updated with the change and continue to behave as they did in previous NICo versions.  In order to use the new version, a new SKU must be created.
@@ -66,14 +66,14 @@ auto_generate_missing_sku_interval = "300s"
 
  - `enabled` - Enables or disables the entire bom validation process.  When disabled, machines
   will skip bom validation and proceed as if all validation has passed.
- - `allow_allocation_on_validation_failure` - When true, machines with an assigned SKU are allowed to stay in Ready state
-  and remain allocatable even when SKU validation fails. Validation still occurs but only logs are recorded - health reports
-  are cleared instead of recording validation failures. Machines do not transition into failed states
-  (SkuVerificationFailed or SkuMissing). When false (default), standard mode applies where validation failures are recorded
-  in health reports and machines enter failed states and become unallocatable until fixed. This is useful for avoiding machine
-  allocation blockage due to SKU validation issues when you only need logging without health report alerts. This option does
-  not bypass a machine without an assigned SKU; with `ignore_unassigned_machines = false`, that machine waits for SKU
-  assignment.
+ - `allow_allocation_on_validation_failure` - When true, validation failures for machines with assigned SKUs do not block
+  allocation. For a SKU mismatch, NICo logs the mismatch and the machine proceeds without a SKU validation health report.
+  A Ready machine whose assigned SKU is missing stays Ready. A missing SKU found during an in-progress verification can enter
+  `SkuMissing` and record a health report. On a later reconciliation, a machine with an assigned SKU in `SkuMissing` or
+  `SkuVerificationFailed` can leave BOM validation, clearing that report and resuming normal lifecycle processing. When false
+  (default), standard mode applies where validation failures are recorded in health reports and machines enter failed states
+  and become unallocatable until fixed. This option does not bypass a machine without an assigned SKU; with
+  `ignore_unassigned_machines = false`, that machine waits for SKU assignment.
  - `ignore_unassigned_machines` - When true, BOM validation is skipped for a machine without an assigned SKU, allowing it
   to proceed without hardware validation or waiting for SKU assignment. During initial ingestion and while waiting for
   assignment, NICo attempts to match eligible machines to existing SKUs; a machine that receives a SKU is validated.
