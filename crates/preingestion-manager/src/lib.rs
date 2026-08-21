@@ -53,6 +53,7 @@ use model::site_explorer::{
     PowerDrainState, PreingestionState, TimeSyncResetPhase,
 };
 use opentelemetry::metrics::Meter;
+use serde_json::Value;
 use sqlx::PgPool;
 use tokio::fs::File;
 use tokio::io::AsyncBufReadExt;
@@ -91,6 +92,10 @@ const INITIAL_BMC_RESET_MAX_ATTEMPTS: u32 = 3;
 const SET_NTP_SERVERS_MAX_ATTEMPTS: u32 = 3;
 /// How long to wait for NTP servers to converge before checking time sync.
 const SET_NTP_SERVERS_CONVERGENCE_WAIT: chrono::TimeDelta = chrono::TimeDelta::minutes(1);
+
+/// Redfish has used both spellings for the UEFI attribute that enables OP-TEE,
+/// which provides fTPM on a BlueField DPU.
+const DPU_FTPM_BIOS_ATTRIBUTE_NAMES: [&str; 2] = ["EnableOPTEE", "Enable OP-TEE"];
 
 pub struct PreingestionManager {
     static_info: Arc<PreingestionManagerStatic>,
@@ -361,6 +366,8 @@ async fn one_endpoint(
     // Main state machine match.
     let delayed_upgrade = match &endpoint.preingestion_state {
         PreingestionState::Initial => {
+            static_info.enable_dpu_ftpm(db, endpoint).await?;
+
             // Kick off a one-shot BMC reset before the time-sync / firmware
             // checks so pairing sees a stable BMC.
             db.with_txn(|txn| {
@@ -512,6 +519,64 @@ async fn one_endpoint(
 }
 
 impl PreingestionManagerStatic {
+    /// Enables the BlueField fTPM prerequisite before the rest of initial
+    /// preingestion. BIOS settings apply only on a DPU reboot, so restart the
+    /// DPU after staging the change.
+    async fn enable_dpu_ftpm(
+        &self,
+        db: &PgPool,
+        endpoint: &ExploredEndpoint,
+    ) -> PreingestionManagerResult<()> {
+        if !endpoint.report.is_dpu() {
+            return Ok(());
+        }
+
+        let redfish_client = self
+            .redfish_client_pool
+            .create_client_for_ingested_host(endpoint.address, db)
+            .await?;
+        let bios = redfish_client.bios().await?;
+
+        match dpu_ftpm_state(&bios) {
+            DpuFtpmState::Enabled => {
+                tracing::debug!(
+                    bmc_ip_address = %endpoint.address,
+                    "DPU fTPM is already enabled"
+                );
+            }
+            DpuFtpmState::Disabled { attribute_name } => {
+                redfish_client
+                    .set_bios(HashMap::from([(
+                        attribute_name.to_string(),
+                        Value::Bool(true),
+                    )]))
+                    .await?;
+                tracing::info!(
+                    bmc_ip_address = %endpoint.address,
+                    bios_attribute = attribute_name,
+                    "Enabled DPU fTPM; restarting DPU to apply the BIOS setting"
+                );
+                instrument_power_op(
+                    PowerOperation::ForceRestart,
+                    redfish_client.power(SystemPowerControl::ForceRestart),
+                    PowerControlLog::Step {
+                        bmc_ip_address: endpoint.address,
+                        step: PowerControlStep::UefiReboot,
+                    },
+                )
+                .await?;
+            }
+            DpuFtpmState::Unsupported => {
+                tracing::warn!(
+                    bmc_ip_address = %endpoint.address,
+                    "DPU does not report an OP-TEE BIOS setting; cannot enable fTPM"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     async fn firmware_config_snapshot(
         &self,
         db: &PgPool,
@@ -3019,6 +3084,29 @@ impl PreingestionManagerStatic {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DpuFtpmState {
+    Enabled,
+    Disabled { attribute_name: &'static str },
+    Unsupported,
+}
+
+fn dpu_ftpm_state(bios: &HashMap<String, Value>) -> DpuFtpmState {
+    let Some(attributes) = bios.get("Attributes").and_then(Value::as_object) else {
+        return DpuFtpmState::Unsupported;
+    };
+
+    for attribute_name in DPU_FTPM_BIOS_ATTRIBUTE_NAMES {
+        match attributes.get(attribute_name).and_then(Value::as_bool) {
+            Some(true) => return DpuFtpmState::Enabled,
+            Some(false) => return DpuFtpmState::Disabled { attribute_name },
+            None => {}
+        }
+    }
+
+    DpuFtpmState::Unsupported
+}
+
 #[derive(Debug, Clone)]
 pub enum BfbCopyResult {
     Success,
@@ -3618,6 +3706,26 @@ mod tests {
 
             "default fallback" {
                 "7.00.00.00" => "6.50.00.00".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn dpu_ftpm_state_recognizes_supported_redfish_bios_attributes() {
+        value_scenarios!(run = |attributes| {
+            dpu_ftpm_state(&HashMap::from([(
+                "Attributes".to_string(),
+                Value::Object(attributes.into_iter().collect()),
+            )]))
+        };
+            "fTPM BIOS attribute state" {
+                HashMap::from([("EnableOPTEE".to_string(), Value::Bool(false))]) =>
+                    DpuFtpmState::Disabled { attribute_name: "EnableOPTEE" },
+                HashMap::from([("Enable OP-TEE".to_string(), Value::Bool(false))]) =>
+                    DpuFtpmState::Disabled { attribute_name: "Enable OP-TEE" },
+                HashMap::from([("EnableOPTEE".to_string(), Value::Bool(true))]) =>
+                    DpuFtpmState::Enabled,
+                HashMap::new() => DpuFtpmState::Unsupported,
             }
         );
     }

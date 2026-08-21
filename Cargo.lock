@@ -2754,6 +2754,7 @@ dependencies = [
  "libredfish",
  "opentelemetry 0.32.0",
  "prometheus-text-parser",
+ "serde_json",
  "sqlx",
  "tempfile",
  "thiserror 2.0.18",
@@ -6929,7 +6930,6 @@ dependencies = [
 [[package]]
 name = "libredfish"
 version = "0.0.0"
-source = "git+https://github.com/NVIDIA/libredfish.git?tag=v0.46.8#92267da9072fd1ed74326e5f5ca6e9366fe9c4b5"
 dependencies = [
  "chrono",
  "clap",

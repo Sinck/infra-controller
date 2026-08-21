@@ -128,6 +128,9 @@ struct RedfishSimState {
     network_adapter_port_mac_addresses: Vec<MacAddress>,
     /// Chassis linked from the simulated ComputerSystem.
     system_chassis_ids: Vec<String>,
+    /// Current BIOS attributes by Redfish client target. Tests seed these to
+    /// exercise behavior that depends on a platform-specific BIOS setting.
+    bios_attributes: HashMap<String, HashMap<String, serde_json::Value>>,
 }
 
 /// Build the `HTTPErrorCode` a real BMC would return for a rejected request, so
@@ -306,6 +309,27 @@ impl RedfishSim {
 
     pub fn set_is_bios_setup(&self, ready: bool) {
         self.state.lock().unwrap().is_bios_setup = Some(ready);
+    }
+
+    /// Seed the BIOS attributes returned for a Redfish client target.
+    pub fn set_bios_attributes(&self, host: &str, attributes: HashMap<String, serde_json::Value>) {
+        self.state
+            .lock()
+            .unwrap()
+            .bios_attributes
+            .insert(host.to_string(), attributes);
+    }
+
+    /// Return the BIOS attributes currently recorded for a Redfish client
+    /// target.
+    pub fn bios_attributes(&self, host: &str) -> HashMap<String, serde_json::Value> {
+        self.state
+            .lock()
+            .unwrap()
+            .bios_attributes
+            .get(host)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Force whether simulated Redfish reports the boot order as configured,
@@ -852,14 +876,36 @@ impl Redfish for RedfishSimClient {
         &'a self,
     ) -> libredfish::RedfishFuture<'a, Result<HashMap<String, serde_json::Value>, RedfishError>>
     {
-        Box::pin(async move { todo!() })
+        Box::pin(async move {
+            let attributes = self
+                .state
+                .lock()
+                .unwrap()
+                .bios_attributes
+                .get(&self._host)
+                .cloned()
+                .unwrap_or_default();
+            Ok(HashMap::from([(
+                "Attributes".to_string(),
+                serde_json::Value::Object(attributes.into_iter().collect()),
+            )]))
+        })
     }
 
     fn set_bios<'a>(
         &'a self,
-        _values: HashMap<String, serde_json::Value>,
+        values: HashMap<String, serde_json::Value>,
     ) -> libredfish::RedfishFuture<'a, Result<(), RedfishError>> {
-        Box::pin(async move { todo!() })
+        Box::pin(async move {
+            self.state
+                .lock()
+                .unwrap()
+                .bios_attributes
+                .entry(self._host.clone())
+                .or_default()
+                .extend(values);
+            Ok(())
+        })
     }
 
     fn pending<'a>(

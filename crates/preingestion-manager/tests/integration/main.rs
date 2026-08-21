@@ -17,5 +17,6 @@
 
 // Keep the suites in one executable: sqlx-testing's migrated template is process-local.
 mod common;
+mod dpu_ftpm;
 mod host_bmc_firmware;
 mod time_sync;
