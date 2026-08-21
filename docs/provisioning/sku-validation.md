@@ -66,9 +66,9 @@ auto_generate_missing_sku_interval = "300s"
 
  - `enabled` - Enables or disables the entire bom validation process.  When disabled, machines
   will skip bom validation and proceed as if all validation has passed.
- - `allow_allocation_on_validation_failure` - When true, validation failures for machines with assigned SKUs do not block
-  allocation. For a SKU mismatch, NICo logs the mismatch and the machine proceeds without a SKU validation health report.
-  A Ready machine whose assigned SKU is missing stays Ready. A missing SKU found during an in-progress verification can enter
+ - `allow_allocation_on_validation_failure` - When true, assigned-SKU mismatches do not block allocation immediately.
+  For a SKU mismatch, NICo logs the mismatch and the machine proceeds without a SKU validation health report. A Ready machine
+  whose assigned SKU is missing stays Ready. A missing SKU found during an in-progress verification can still enter
   `SkuMissing` and record a health report. On a later reconciliation, a machine with an assigned SKU in `SkuMissing` or
   `SkuVerificationFailed` can leave BOM validation, clearing that report and resuming normal lifecycle processing. When false
   (default), standard mode applies where validation failures are recorded in health reports and machines enter failed states
