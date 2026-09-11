@@ -952,7 +952,7 @@ events, so consumers handle them identically.
 | Field | Type | Default | Description |
 | ------- | ------ | --------- | ------------- |
 | `bfb_url` | `Option<String>` | BF3 bf-bundle URL | BlueField firmware bundle used for BF3 provisioning. Mutually exclusive with `bluefield_software`; BF4 requires `bluefield_software` instead. |
-| `bluefield_software` | `Option<BlueFieldSoftwareConfig>` | — | BF4 OS ISO and PSID-to-PLDM firmware source. BF4 requires this field with exactly one `pldm_fw_bundle` entry. |
+| `bluefield_software` | `Option<BlueFieldSoftwareConfig>` | — | BF4 OS ISO and PSID-to-PLDM firmware source. BF4 requires this field with at least one `pldm_fw_bundle` entry. |
 | `flavor_name` | `String` | `carbide-dpu-flavor` | Base name for the generated BF3/generic-BF4 `DPUFlavor` or Astra `DPUFlavorTemplate`. |
 | `deployment_name` | `String` | `nico-deployment-v2` | Name of the generated `DPUDeployment`. |
 | `node_label_key` | `String` | `carbide.nvidia.com/controlled.node.v2` | Label key used to select DPU nodes for this deployment. |
