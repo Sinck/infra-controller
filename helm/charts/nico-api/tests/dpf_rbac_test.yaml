@@ -12,20 +12,20 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["get", "create"]
+            verbs: ["create"]
       - contains:
           path: rules
           content:
             apiGroups: [""]
             resources: ["secrets"]
             resourceNames: ["bmc-shared-password"]
-            verbs: ["patch"]
+            verbs: ["get", "patch"]
       - notContains:
           path: rules
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["get", "create", "patch"]
+            verbs: ["get", "create"]
       - notContains:
           path: rules
           content:

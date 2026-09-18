@@ -1254,7 +1254,7 @@ prevents a rolling update from activating local ownership while an older
 replica can still register a DPU that uses the shared credential. On a transient
 rotation-target read failure, a present local v0 permits startup and retry. After
 accepting local v0, NICo retains that last shared value and logs an error if the
-entry disappears; restore the unchanged local value. The default pinned DPF
+entry disappears. To recover, restore the local value unchanged. The default pinned DPF
 v26.4.0 does not support BMC credential rotation, so NICo retains the shared
 Secret. Adopting and validating supporting DPF behavior is tracked by
 [#6147](https://github.com/NVIDIA/infra-controller/issues/6147). Other current
