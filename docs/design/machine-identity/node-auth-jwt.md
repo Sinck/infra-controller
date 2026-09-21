@@ -1,10 +1,8 @@
 # Node-Auth: Self-Signed Bearer JWTs for Scout and DPU-Agent
 
-Design for [#355](https://github.com/dsx-ai-factory/infra-controller/issues/355)
-(sub-issue of the Vault-elimination epic
-[#195](https://github.com/dsx-ai-factory/infra-controller/issues/195)): Scout and the
-DPU-agent authenticate to the API with short-lived bearer JWTs alongside —
-and eventually instead of — mTLS client certificates.
+Design for [#355](https://github.com/dsx-ai-factory/infra-controller/issues/355):
+Scout and the DPU-agent authenticate to the API with short-lived bearer JWTs
+alongside mTLS client certificates.
 
 Nodes sign their own tokens with the private key of their **existing** mTLS
 client certificate. There is no new key material anywhere, no server-side
@@ -30,16 +28,6 @@ Approaches that were weighed and rejected are recorded under
 It is distinct from the tenant-facing [SPIFFE JWT-SVID design](spiffe-svid-sdd.md):
 that issues identity tokens *to tenant workloads* via IMDS; this design covers
 how *NICo's own node agents* authenticate to the NICo API.
-
-> **Vault-removal status:** This document describes the implementation merged
-> for [#355](https://github.com/dsx-ai-factory/infra-controller/issues/355), which signs
-> with the private key of the Vault-issued mTLS machine certificate. The
-> required Vault-free path keeps that signing model and reissues the certificate
-> through the non-Vault provider tracked under
-> [#5200](https://github.com/dsx-ai-factory/infra-controller/issues/5200).
-> fTPM-backed DPU signing in
-> [#5272](https://github.com/dsx-ai-factory/infra-controller/issues/5272) is an
-> optional stretch goal.
 
 ## How it works
 

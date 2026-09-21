@@ -12,16 +12,9 @@
 
 ## 1. Introduction
 
-This design document specifies the NICo Core secret-storage subsystem: a configurable credential chain introducing a Postgres-backed, envelope-encrypted secret store alongside the existing Vault/OpenBao store, together with the key-management layer protecting stored secrets. The default configuration reproduces today's behavior exactly, so adoption is opt-in and reversible at each step.
+This design document specifies the NICo Core secret-storage subsystem: a configurable credential chain introducing a Postgres-backed, envelope-encrypted secret store alongside the existing Vault/OpenBao store, together with the key-management layer protecting stored secrets. The default configuration reproduces the legacy environment → file → Vault behavior exactly, so adoption is opt-in and reversible at each step.
 
 The document outlines the architecture, runtime flows, data model, configuration, and security considerations, and describes how the credential chain, its backends, and the key-encryption-key (KEK) providers interact.
-
-> **Vault-removal status:** This document describes the implemented storage and
-> migration subsystem. Selection and production qualification of a non-Vault KEK
-> provider are tracked in
-> [#3253](https://github.com/dsx-ai-factory/infra-controller/issues/3253), under
-> the remaining key and certificate services epic
-> [#5200](https://github.com/dsx-ai-factory/infra-controller/issues/5200).
 
 ### 1.1 Purpose
 
@@ -157,7 +150,7 @@ Migration from Vault runs once at boot, guarded to stay safe across replicas, an
 
 The subsystem is adopted as a sequence of configuration changes, each reversible:
 
-* **Development/test site, or a deployment that explicitly accepts local KEK custody**: set `backends = ["postgres"]`, `writer = "postgres"`, and an Integrated KEK; every secret is envelope-encrypted in Postgres from the start. Inline values remain development/test material. A hardened mounted-key Integrated deployment becomes a supported production interim only if #3253 selects and qualifies its custody, availability, rotation, and recovery model.
+* **Development/test site, or a deployment that explicitly accepts local KEK custody**: set `backends = ["postgres"]`, `writer = "postgres"`, and an Integrated KEK; every secret is envelope-encrypted in Postgres from the start. Inline values remain development/test material. Operators using mounted `env` or `file` key sources own key custody, startup availability, controlled-restart rotation, backup, and recovery.
 * **Migrate an existing Vault site**: progress through the stages in Figure-6: legacy, dual-read (import seeds Postgres while Vault stays authoritative), flip (Postgres authoritative, Vault as the fallback), then Postgres-only; revert configuration to roll back at any step.
 * **Rotate a KEK**: repoint every route off the old `kek_id` to a new one (a new provider), run `secrets re-wrap`, and retain the old KEK after `stale_remaining` reaches zero until no retained backup needs it and the rollback window has ended. Because `stale_remaining` counts live rows on any KEK no route references, the old KEK must be de-routed everywhere first, but a zero count alone does not authorize deleting it.
 * **Keep KEK custody in Vault/OpenBao**: configure a Transit provider so KEK material never leaves the server and DEKs are wrapped and unwrapped server-side.
