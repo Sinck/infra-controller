@@ -22,30 +22,39 @@ MAT_MODE=scale HOST_COUNT=1000 helm-prereqs/setup-machine-a-tron.sh -y
    from-scratch runs are reproducible.
 1. **`MAT_MODE=scale`** — a scale profile
    (`helm-prereqs/values/machine-a-tron-scale.yaml`) using Controller Mode
-   with the `mat-k8s-controller` for dynamic per-BMC ClusterIP Services.
+   with the `mat-k8s-controller` for dynamic per-BMC Services.
 
 ## Architecture: Controller Mode
 
-The `mat-k8s-controller` dynamically creates one ClusterIP Service per BMC:
+The `mat-k8s-controller` dynamically creates one Service per BMC:
+
 - Discovers machine-a-tron pods via `nvidia-infra-controller/mat-service=true` label
 - Polls `/machines/status` from each pod
-- Creates Services with ClusterIP = BMC IP (assigned by NICo DHCP)
+- Creates Services with the BMC IP (assigned by NICo DHCP) as `externalIPs`
 - Services route to correct pod via `nvidia-infra-controller/pod-name` selector
 
 **Requirements:**
-- `oobDhcpRelayAddress` must be within Kubernetes ServiceCIDR
+
+- The BMC network must lie outside the Kubernetes ServiceCIDR, pod CIDR,
+  node network, and networks that nodes or pods must otherwise reach
+  (BMC IPs are Service externalIPs, for which kube-proxy programs forwarding
+  rules on every node). `setup-machine-a-tron.sh` checks every BMC network in
+  the values file against the ServiceCIDR and stops when it cannot determine
+  the ServiceCIDR (`SCALE_SERVICE_CIDRS`, `SCALE_BMC_PREFIXES`, and
+  `SCALE_ALLOW_UNKNOWN_SERVICE_CIDR` in the script header)
 - NICo siteConfig needs `allow_insecure_discovery = true` and a network
   covering the BMC IP range
-- Leave `site_explorer.bmc_proxy` unset — NICo dials each BMC's ClusterIP directly
+- Leave `site_explorer.bmc_proxy` unset - NICo dials each BMC IP directly
 
 **Example NICo siteConfig:**
+
 ```toml
 allow_insecure_discovery = true
 
 [networks.MAT-BMC-SERVICES]
 type = "underlay"
-prefix = "10.96.64.0/18"
-gateway = "10.96.64.1"
+prefix = "10.200.0.0/18"
+gateway = "10.200.0.1"
 mtu = 1500
 ```
 
@@ -62,7 +71,7 @@ in the scripts/charts with explanatory comments.
 | 2 | Redfish redirect silently ignored | Docs said `override_target_host` — never a valid field; the real field is `bmc_proxy = "host:port"`, and it must be the **cross-namespace FQDN** (site-explorer runs in nico-system; a bare service name doesn't resolve) | Script sets `bmc_proxy` correctly; docs fixed |
 | 3 | site-explorer aborts every run: `MissingCredentials` | `machines/bmc/site/root` isn't in default kvSeeds; the seeded UEFI creds ship with **empty** passwords which fail validation | Script seeds the full chain |
 | 4 | Host BMCs 401 while DPUs explore fine | Host and DPU mock factory passwords differ (`factory_password` vs `0penBmc`); the host factory Vault path vendor segment is **lowercase** (`…/dell` — `BMCVendor`'s `Display` lowercases; the earlier capital-`Dell` seed was read by nobody) | Script seeds both factory creds on the correct paths |
-| 5 | machine-a-tron's expected-machine registration 403s (logged misleadingly as "likely already ingested") | `Machineatron` principal missing from the `AddExpectedMachine` RBAC grant — an oversight; it holds the sibling grants (`DiscoverDhcp`, `CreateNetworkSegment`, `GetExpectedSwitch`) | One-line fix in `internal_rbac_rules.rs`; script includes a DB fallback for nico-api builds without it |
+| 5 | machine-a-tron's expected-machine registration 403s (each failed record is logged and startup exits non-zero) | `Machineatron` principal missing from the `AddExpectedMachine` RBAC grant - an oversight; it holds the sibling grants (`DiscoverDhcp`, `CreateNetworkSegment`, `GetExpectedSwitch`) | One-line fix in `internal_rbac_rules.rs`; script includes a DB fallback for nico-api builds without it |
 | 6 | Endpoints permanently stuck `AvoidLockout` (NICO-SITEEXPLORER-144) on a fresh deploy | Per-MAC rotated creds (`machines/bmc/<mac>/root`) survive cleanup; a fresh mock is at factory password but the per-MAC entry makes site-explorer present the old rotated one → 401 latch, self-perpetuating by design | Cleanup purges per-MAC creds; setup self-heals stale ones (only when the machine graph is truly empty — machines AND interfaces at 0) |
 | 7 | `DiscoverDhcp` fails for every BMC: "no rows returned…" | The `machine_dhcp_records` VIEW inner-joins a singleton control row (`machine_interfaces_deletion` id=1); manual lease cleanup had deleted it | Script restores the singleton; documented: never hand-delete lease rows |
 | 8 | Machines never created: admin pool exhausted | Real demand is OOB = `hosts×(1+dpus)` and admin = `hosts×(dpus+1)` (one host-PF IP per DPU **plus one per host at creation**); usable = `2^(32-mask) − reserve_first − 1` | Sizing check with auto-fit; `reserve_first` parsed from the live site config |

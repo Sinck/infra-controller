@@ -137,6 +137,15 @@ Some registries use a fixed username with API-key auth — set `REGISTRY_PULL_US
 
 ## Cluster Prerequisites
 
+The chart can create the namespace, its `nico.nvidia.com/managed` label, and
+the image pull Secret itself. The `templates/namespace.yaml` template renders
+the Namespace when `global.namespaceOverride` is set and `createNamespace` is
+true (the default). Setting `imagePullSecret.create` to true renders the
+Secret. Refer to the
+[Helm-Only Deployment](https://github.com/dsx-ai-factory/infra-controller/blob/main/helm/charts/nico-machine-a-tron/README.md#helm-only-deployment)
+section of the chart README. The steps below create the same resources
+manually.
+
 ### Namespaces and secrets
 
 ```bash
@@ -197,16 +206,32 @@ and `machines/all_hosts/site_default/uefi-metadata-items/auth`. The two UEFI
 paths are created by the nico-prereqs `kvSeeds` but with **empty passwords**,
 which fails the check (`vault does not have a valid password entry`) — they
 must be re-seeded with any non-empty password. `machines/bmc/site/root` is not
-seeded at all; without it every run aborts with `MissingCredentials`.
+seeded by default; without it every run aborts with `MissingCredentials`.
+Enabling `siteCredentials` in `helm-prereqs/values.yaml` provides all three as
+a Kubernetes Secret that nico-api reads as its credential file ahead of Vault.
+Refer to
+[Site Credentials Secret](https://github.com/dsx-ai-factory/infra-controller/blob/main/helm-prereqs/README.md#site-credentials-secret).
+`setup-machine-a-tron.sh` Phase 4 still seeds them in Vault, and the file
+shadows those entries.
 
-Beyond the preconditions, the **credential rotation flow** requires this exact
-chain (all handled by `setup-machine-a-tron.sh` Phase 4):
+For the default BlueField-3 simulation, the **credential rotation flow**
+requires this exact chain, which `setup-machine-a-tron.sh` Phase 4 handles:
 
 | Vault path | Value | Why |
 |------------|-------|-----|
 | `machines/all_hosts/factory_default/bmc-metadata-items/dell` | `root`/`factory_password` | Host BMC factory default (mock's `DUMMY_FACTORY_PASSWORD`). Path segment is **lowercase** `dell` — `BMCVendor`'s `Display` impl lowercases. |
-| `machines/all_dpus/factory_default/bmc-metadata-items/root` | `root`/`0penBmc` | DPU BMC factory default (mock's `DUMMY_FACTORY_DPU_PASSWORD`) — note it differs from the host factory password. |
+| `machines/all_dpus/factory_default/bmc-metadata-items/root` | `root`/`0penBmc` | Legacy DPU BMC catch-all (`DpuModel::Unknown`). Matches `DpuModel::default_factory_credentials()` for BF2, BF3, and unidentified models. `bmc-mock` uses that source for the BF3 account it creates; site-explorer uses it for its final fallback. It differs from the host factory password. |
 | `machines/bmc/site/root` | `root`/&lt;distinct&gt; | Rotation target. **Must differ from both factory passwords**, or the rotation is a no-op and the mock rejects with `403 Factory-default password must be changed` forever. |
+
+<Note title="BlueField-4 factory credentials">
+The machine-a-tron hardware types `dell_poweredge_r760_bf4` and `nvidia_dgx_vr`
+use BlueField-4 DPUs with `admin`/`0penBmc` factory credentials. site-explorer
+checks the model-specific entry, then the `root` catch-all, then the built-in
+per-model default. Because Phase 4 seeds the catch-all but not the model entry,
+seed `machines/all_dpus/factory_default/bmc-metadata-items/bf4` with the BF4
+credentials before using either type. Otherwise, site-explorer attempts the
+`root` username and a `401 Unauthorized` latches `AvoidLockout`.
+</Note>
 
 site-explorer logs into each BMC with its factory default, rotates the password
 to the site root value, then proceeds — using the wrong factory password (or a
@@ -223,8 +248,8 @@ Copy `helm-prereqs/values/machine-a-tron.yaml` and fill in the site-specific val
 | Field | Description |
 |-------|-------------|
 | `image.tag` | Tag produced by [building the container image](#building-the-container-image) (e.g. `8c35783af-amd64`) |
-| `machines.dell-hosts.oobDhcpRelayAddress` | Gateway of the OOB/underlay network from nico-core site config |
-| `machines.dell-hosts.adminDhcpRelayAddress` | Gateway of the admin network from nico-core site config |
+| `machines.dell-hosts.bmcDhcpRelayAddress` | Gateway of the BMC (OOB) network from nico-core site config; relay for BMC DHCP (previously `oobDhcpRelayAddress`, still accepted) |
+| `machines.dell-hosts.underlayDhcpRelayAddress` | Gateway of the underlay segment that serves DPU OOB and switch NVOS DHCP (previously `adminDhcpRelayAddress`, still accepted) |
 | `machines.dell-hosts.hostCount` | Must not exceed available OOB DHCP addresses (`hostCount + hostCount×dpuPerHostCount`) |
 
 ### SPIFFE URI override
@@ -298,6 +323,15 @@ cross-namespace requirement), and the nico-core `bmc_proxy` setting both
 enables that path and covers the case where the runtime call has not happened
 yet.
 
+Both mechanisms configure the dynamic `site_explorer.bmc_proxy` redirect.
+This redirect applies to clients built from `nico-api`'s direct Redfish pool.
+
+The redirect is independent of the static `[bmc_proxy]` configuration, which
+routes eligible `nico-api` Redfish traffic through `nico-bmc-proxy`. When
+the static section is enabled, eligible traffic uses a proxied pool that
+ignores the dynamic redirect. The admin Redfish passthrough also uses the
+static configuration when both are configured.
+
 Apply via `helm upgrade` of the nico-core chart, or patch the configmap and
 restart nico-api (site-explorer runs in-process in nico-api):
 
@@ -316,17 +350,19 @@ default in the values file). DHCP discovery alone is **not** sufficient.
 ## Multi-pod simulation with Controller Mode
 
 The chart can shard the simulated fleet across several machine-a-tron pods.
-The `mat-k8s-controller` dynamically creates ClusterIP Services for each BMC,
-with ClusterIP = BMC IP assigned by NICo DHCP. NICo dials each BMC IP directly
-— no `bmc_proxy`. A validated example lives at
+The `mat-k8s-controller` dynamically creates a Service for each BMC, publishing
+the BMC IP assigned by NICo DHCP as the Service's `externalIPs`. NICo dials each
+BMC IP directly - no `bmc_proxy`. A validated example lives at
 `helm-prereqs/values/machine-a-tron-multipod.yaml`.
 
 Everything single-pod mode needs still applies (namespaces, CA copy, Vault
 seeds, SPIFFE URI). Multi-pod with controller adds the following requirements:
 
-1. **`oobDhcpRelayAddress` must be within Kubernetes ServiceCIDR.** All pods
-   can share the same relay address — NICo assigns unique IPs from the network.
-   Default ServiceCIDR ranges:
+1. **The BMC network must lie outside the Kubernetes ServiceCIDR and pod
+   CIDR.** BMC IPs are Service `externalIPs`, which the apiserver neither
+   allocates nor validates, so an overlap collides with dynamically allocated
+   clusterIPs. All pods can share the same relay address - NICo assigns unique
+   IPs from the network. Default ServiceCIDR ranges to stay clear of:
    - `10.96.0.0/12` - vanilla Kubernetes (kubeadm)
    - `10.96.0.0/16` - kind
    - `10.43.0.0/16` - k3d/K3s
@@ -340,13 +376,13 @@ seeds, SPIFFE URI). Multi-pod with controller adds the following requirements:
 
    [networks.MAT-BMC-SERVICES]
    type = "underlay"
-   prefix = "10.96.64.0/18"
-   gateway = "10.96.64.1"
+   prefix = "10.200.0.0/18"
+   gateway = "10.200.0.1"
    mtu = 1500
    ```
 
 1. **Leave `site_explorer.bmc_proxy` unset.** The Redfish client dials each
-   BMC's ClusterIP directly.
+   BMC IP directly.
 
 1. **Disjoint MAC pools per pod.** The Helm chart **auto-generates** unique
    MAC address pools per pod based on pod index. The format is
@@ -370,16 +406,16 @@ seeds, SPIFFE URI). Multi-pod with controller adds the following requirements:
             hwType: wiwynn_gb200_nvl
             hostCount: 100
             dpuPerHostCount: 2
-            oobDhcpRelayAddress: "10.96.64.1"  # All pods share same relay
-            adminDhcpRelayAddress: "192.168.176.1"
+            bmcDhcpRelayAddress: "10.200.0.1"  # All pods share same relay
+            underlayDhcpRelayAddress: "10.104.0.1"
       mat-1:
         machines:
           compute:
             hwType: wiwynn_gb200_nvl
             hostCount: 100
             dpuPerHostCount: 2
-            oobDhcpRelayAddress: "10.96.64.1"  # NICo assigns unique IPs
-            adminDhcpRelayAddress: "192.168.176.1"
+            bmcDhcpRelayAddress: "10.200.0.1"  # NICo assigns unique IPs
+            underlayDhcpRelayAddress: "10.104.0.1"
 
     macAddressPool:
       enabled: true
@@ -469,4 +505,4 @@ The `machine_dhcp_records` view inner-joins the singleton control row `machine_i
 | `Refusing to create managed host`; machine-a-tron logs `PermissionDenied` on registration | nico-api build lacks the `Machineatron` → `AddExpectedMachine` RBAC grant | Rebuild nico-api with the grant (internal_rbac_rules.rs); the setup script also has a DB fallback |
 | `SIGSEGV` compiling `aws-lc-sys` | QEMU emulates the `.S` assembler, which crashes | True cross-compilation (native arm64 host → x86_64 target) instead of QEMU |
 | site-explorer aborts with `MissingCredentials .../uefi-metadata-items/auth` | kvSeeds create the UEFI creds with **empty** passwords, which fail validation | Re-seed both site_default UEFI creds with any non-empty password |
-| site-explorer aborts with `MissingCredentials machines/bmc/site/root` | Site BMC root cred not in default `kvSeeds` | Seed `secrets/machines/bmc/site/root` = `root`/&lt;non-factory password&gt; in Vault |
+| site-explorer aborts with `MissingCredentials machines/bmc/site/root` | Site BMC root cred not in default `kvSeeds` | Seed `secrets/machines/bmc/site/root` = `root`/&lt;non-factory password&gt; in Vault, or enable `siteCredentials` in `helm-prereqs/values.yaml` ([Site Credentials Secret](https://github.com/dsx-ai-factory/infra-controller/blob/main/helm-prereqs/README.md#site-credentials-secret)) |

@@ -16,14 +16,20 @@
  */
 
 mod boot_interface_resolution;
+mod chassis_reset;
 mod client_resolution;
 pub(in crate::tests) mod common;
+mod component_manager;
+mod dhcp_cross_family_regression_test;
 mod dpf;
 mod dpu_machine_update;
 mod dpu_nic_firmware;
 mod dpu_remediation;
 mod dpu_reprovisioning;
+mod expected_component_patch;
 mod expected_machine;
+mod expected_rack;
+mod expected_rack_group;
 mod expected_switch;
 mod explored_endpoint_find;
 mod extension_service;
@@ -60,6 +66,7 @@ mod machine_update_manager;
 mod machine_validation;
 mod maintenance;
 mod managed_host_decommissioning;
+mod managed_host_reset;
 #[cfg(feature = "linux-build")]
 mod measured_boot;
 mod network_security_group;
@@ -72,12 +79,16 @@ mod preingestion_dpu_nic_mode;
 mod primary_interface;
 mod rack_health;
 mod rack_state_controller;
+mod redfish_actions;
 mod resource_pool;
 mod site_explorer;
 mod site_prefix;
 mod sku;
 mod spdm;
+mod spx_partition;
 mod switch;
+mod tenant_identity_config;
+mod tenant_prefix_startup;
 mod tenants;
 mod tpm_ca;
 mod vpc;

@@ -34,12 +34,15 @@ use carbide_utils::periodic_timer::PeriodicTimer;
 use carbide_uuid::machine::MachineType;
 use carbide_uuid::power_shelf::{PowerShelfIdSource, PowerShelfType};
 use chrono::Utc;
+use component_manager::MachineInfoProvider;
 use config::SiteExplorerConfig;
-use db::{self, DatabaseError, Transaction, machine, power_shelf as db_power_shelf};
+use db::explored_endpoints::EndpointReportNotCurrent;
+use db::{
+    self, ConditionalWrite, DatabaseError, Transaction, machine, power_shelf as db_power_shelf,
+};
 use futures_util::stream::FuturesUnordered;
 use futures_util::{StreamExt, TryFutureExt};
 use itertools::Itertools;
-use librms::RmsApi;
 use mac_address::MacAddress;
 use model::bmc_suppression::BmcSuppressionSubsystem;
 use model::errors::OperatorError;
@@ -79,6 +82,7 @@ pub use metrics::{SiteExplorationMetrics, site_explorer_latency_histogram_view};
 mod bmc_endpoint_explorer;
 mod redfish;
 pub use bmc_endpoint_explorer::{AuthenticatedBmcClient, BmcEndpointExplorer};
+pub use redfish::{BmcAccess, EstablishedBmc, ProxiedPools};
 mod boot_order_tracker;
 use boot_order_tracker::BootOrderTracker;
 mod machine_creator;
@@ -89,7 +93,10 @@ use db::ObjectColumnFilter;
 use db::work_lock_manager::WorkLockManagerHandle;
 pub use managed_host::is_endpoint_in_managed_host;
 use model::DpuModel;
-use model::expected_machine::{ExpectedInterface, ExpectedInterfaceIpAllocation, HostDpuPolicy};
+use model::expected_machine::{
+    ExpectedInterface, ExpectedInterfaceIpAllocation, ExpectedMachine, ExpectedMachineRequest,
+    HostDpuPolicy,
+};
 use model::firmware::FirmwareComponentType;
 use model::network_segment::NetworkSegmentType;
 mod switch_creator;
@@ -105,27 +112,10 @@ use errors::{SiteExplorerError, SiteExplorerResult};
 use self::metrics::{
     BmcResetFinished, BmcResetMethod, BmcResetStatus, BmcResetTimestampPersistenceFailed,
     BootInterfaceSelected, DpuMigrationSignal, PairingBlockerReason, SiteExplorerIterationFinished,
-    SiteExplorerMachineSlotTrayFetchFailed, SiteExplorerMachineSlotTrayResponseMissing,
-    SiteExplorerMachineSlotTrayValueInvalid, exploration_error_to_metric_label,
+    exploration_error_to_metric_label,
 };
 use crate::config::SiteExplorerExploreMode;
 use crate::explored_endpoint_index::ExploredEndpointIndex;
-
-/// Return whether an expected interface is explicitly a non-Redfish DPU OS
-/// endpoint.
-///
-/// Host is the compatibility default for existing interface declarations, so
-/// those entries remain scannable even when they look like data interfaces.
-/// DPU BMC interfaces remain scannable too. A top-level BMC MAC is an
-/// ExpectedMachine identity, so it wins over a historical DPU OS declaration
-/// that reused the same address on any row.
-fn should_skip_expected_interface_redfish_scan(
-    interface: &ExpectedInterface,
-    expected_host_bmc_macs: &HashSet<MacAddress>,
-) -> bool {
-    !expected_host_bmc_macs.contains(&interface.mac_address)
-        && interface.role == model::expected_machine::ExpectedInterfaceRole::DpuOs
-}
 
 /// Return whether a HostInband row can be treated as a Redfish endpoint.
 ///
@@ -265,49 +255,163 @@ fn rms_location_value(value: Option<u32>) -> Result<Option<i32>, u32> {
         .transpose()
 }
 
-/// Fetches `slot_number` and `tray_index` from RMS for one rack/node pair.
-/// Each value remains usable when the other is absent or outside `i32`.
-pub async fn fetch_slot_and_tray(
-    rms_client: &dyn librms::RmsApi,
-    request: librms::protos::rack_manager::BatchGetNodeDeviceInfoRequest,
-) -> (Option<i32>, Option<i32>) {
-    match rms_client.batch_get_node_device_info(request).await {
-        Ok(info) => {
-            let Some(node_device_details) = info.node_device_details.first() else {
-                carbide_instrument::emit(SiteExplorerMachineSlotTrayResponseMissing::new());
-                return (None, None);
-            };
-
-            let slot_number =
-                rms_location_value(node_device_details.slot_number).unwrap_or_else(|value| {
-                    carbide_instrument::emit(SiteExplorerMachineSlotTrayValueInvalid::SlotNumber {
-                        value,
-                    });
-                    None
-                });
-            let tray_index =
-                rms_location_value(node_device_details.tray_index).unwrap_or_else(|value| {
-                    carbide_instrument::emit(SiteExplorerMachineSlotTrayValueInvalid::TrayIndex {
-                        value,
-                    });
-                    None
-                });
-
-            (slot_number, tray_index)
-        }
-        Err(e) => {
-            carbide_instrument::emit(SiteExplorerMachineSlotTrayFetchFailed::new(e.to_string()));
-            (None, None)
-        }
-    }
-}
-
 pub struct Endpoint<'a> {
     address: IpAddr,
     iface: &'a MachineInterfaceSnapshot,
     last_explored: Option<&'a ExploredEndpoint>,
     pub(crate) expected: Option<&'a ExpectedEntity>,
     pause_ingestion_and_poweron: bool,
+}
+
+/// An explored endpoint and the underlay interface it is probed through.
+type Candidate<'a> = (IpAddr, &'a MachineInterfaceSnapshot, &'a ExploredEndpoint);
+
+/// What one iteration probes, in probe order. Operator requests sit outside
+/// the `explorations_per_run` budget; the other three tiers share it.
+#[derive(Debug, Default)]
+struct ExplorationPlan<'a> {
+    /// `exploration_requested` endpoints, by address.
+    priority: Vec<Candidate<'a>>,
+    /// Interfaces with no report yet, oldest interface first.
+    unexplored: Vec<(IpAddr, &'a MachineInterfaceSnapshot)>,
+    /// Endpoints preingestion parked with `waiting_for_explorer_refresh`, oldest report first.
+    refresh_waits: Vec<Candidate<'a>>,
+    /// Everything else, oldest report first.
+    routine: Vec<Candidate<'a>>,
+    unexplored_candidates: usize,
+    refresh_wait_candidates: usize,
+    routine_candidates: usize,
+}
+
+impl ExplorationPlan<'_> {
+    fn selected_total(&self) -> usize {
+        self.priority.len() + self.unexplored.len() + self.refresh_waits.len() + self.routine.len()
+    }
+
+    /// Candidate and selected counts per tier, as recorded on the metrics.
+    fn counts(&self) -> [(&'static str, usize); 9] {
+        [
+            ("priority_update_candidates", self.priority.len()),
+            ("unexplored_candidates", self.unexplored_candidates),
+            ("refresh_wait_candidates", self.refresh_wait_candidates),
+            ("routine_update_candidates", self.routine_candidates),
+            ("selected_priority_updates", self.priority.len()),
+            ("selected_unexplored", self.unexplored.len()),
+            ("selected_refresh_waits", self.refresh_waits.len()),
+            ("selected_routine_updates", self.routine.len()),
+            ("selected_total", self.selected_total()),
+        ]
+    }
+}
+
+/// Shares of the `explorations_per_run` budget for the three tiers inside it.
+const UNEXPLORED_SHARE_PERCENT: usize = 70;
+const REFRESH_WAIT_SHARE_PERCENT: usize = 20;
+const ROUTINE_SHARE_PERCENT: usize = 10;
+const _: () =
+    assert!(UNEXPLORED_SHARE_PERCENT + REFRESH_WAIT_SHARE_PERCENT + ROUTINE_SHARE_PERCENT == 100);
+
+/// Endpoints per tier of the `explorations_per_run` budget: candidates or slots.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TierCounts {
+    unexplored: usize,
+    refresh_waits: usize,
+    routine: usize,
+}
+
+impl TierCounts {
+    fn total(&self) -> usize {
+        self.unexplored + self.refresh_waits + self.routine
+    }
+}
+
+/// Sorts the candidates into tiers and spends `budget` on them. Each tier gets
+/// its share of the budget (the `*_SHARE_PERCENT` constants) oldest first:
+/// unexplored endpoints by interface creation, the other two by report time.
+/// Slots a tier cannot fill go to the other tiers in the same order, unexplored
+/// first, so no slot stays unused while any tier has candidates. From a budget
+/// of ten up every tier holds its share, so bring-up cannot starve parked BMCs
+/// and parked BMCs cannot starve the routine refresh. Below that the smaller
+/// shares round to zero and those tiers live on what the earlier tiers leave.
+fn plan_explorations<'a>(
+    candidates: Vec<Candidate<'a>>,
+    mut unexplored: Vec<(IpAddr, &'a MachineInterfaceSnapshot)>,
+    budget: usize,
+) -> ExplorationPlan<'a> {
+    let mut priority = Vec::new();
+    let mut refresh_waits = Vec::new();
+    let mut routine = Vec::new();
+    for candidate in candidates {
+        let endpoint = candidate.2;
+        if endpoint.exploration_requested {
+            priority.push(candidate);
+        } else if endpoint.waiting_for_explorer_refresh
+            && endpoint.preingestion_state.parks_for_explorer_refresh()
+        {
+            refresh_waits.push(candidate);
+        } else {
+            routine.push(candidate);
+        }
+    }
+    let oldest_report_first =
+        |(address, _, endpoint): &Candidate<'a>| (endpoint.report_version.timestamp(), *address);
+    priority.sort_by_key(|(address, _, _)| *address);
+    unexplored.sort_by_key(|(address, iface)| (iface.created, *address));
+    refresh_waits.sort_by_key(oldest_report_first);
+    routine.sort_by_key(oldest_report_first);
+
+    let unexplored_candidates = unexplored.len();
+    let refresh_wait_candidates = refresh_waits.len();
+    let routine_candidates = routine.len();
+    let take = allocate(
+        budget,
+        TierCounts {
+            unexplored: unexplored_candidates,
+            refresh_waits: refresh_wait_candidates,
+            routine: routine_candidates,
+        },
+    );
+    unexplored.truncate(take.unexplored);
+    refresh_waits.truncate(take.refresh_waits);
+    routine.truncate(take.routine);
+    ExplorationPlan {
+        priority,
+        unexplored,
+        refresh_waits,
+        routine,
+        unexplored_candidates,
+        refresh_wait_candidates,
+        routine_candidates,
+    }
+}
+
+/// How many of `budget` each tier gets: its share, capped by its candidates,
+/// then the unused rest tier by tier in order. Rounding leftovers go to the
+/// first tier, so a budget below ten still reaches the tiers in order.
+fn allocate(budget: usize, candidates: TierCounts) -> TierCounts {
+    let budget = budget.min(candidates.total());
+    let mut quotas = TierCounts {
+        unexplored: budget * UNEXPLORED_SHARE_PERCENT / 100,
+        refresh_waits: budget * REFRESH_WAIT_SHARE_PERCENT / 100,
+        routine: budget * ROUTINE_SHARE_PERCENT / 100,
+    };
+    quotas.unexplored += budget - quotas.total();
+    let mut take = TierCounts {
+        unexplored: quotas.unexplored.min(candidates.unexplored),
+        refresh_waits: quotas.refresh_waits.min(candidates.refresh_waits),
+        routine: quotas.routine.min(candidates.routine),
+    };
+    let mut spare = budget - take.total();
+    for (taken, wanted) in [
+        (&mut take.unexplored, candidates.unexplored),
+        (&mut take.refresh_waits, candidates.refresh_waits),
+        (&mut take.routine, candidates.routine),
+    ] {
+        let more = (wanted - *taken).min(spare);
+        *taken += more;
+        spare -= more;
+    }
+    take
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -499,7 +603,6 @@ pub struct SiteExplorer {
     /// Backstops the persisted BMC-reset timestamps for the reset rate limit,
     /// so a reset whose timestamp write failed still throttles the next reset.
     recent_bmc_resets: RecentBmcResets,
-    // rms_client: Option<Arc<dyn RmsApi>>,
 }
 
 /// State captured once and applied throughout a Site Explorer iteration.
@@ -512,6 +615,10 @@ impl SiteExplorer {
     const SITE_EXPLORER_HEALTH_REPORT_WRITE_BATCH_SIZE: usize = 500;
 
     #[allow(clippy::too_many_arguments)]
+    /// Creates a site explorer.
+    ///
+    /// When `dpf_enabled_at_site` is true, eligible hosts are marked for DPF-managed ingestion.
+    /// Otherwise, hosts use the non-DPF ingestion path.
     pub fn new(
         database_connection: sqlx::PgPool,
         explorer_config: SiteExplorerConfig,
@@ -521,8 +628,9 @@ impl SiteExplorer {
         common_pools: Arc<CommonPools>,
         work_lock_manager_handle: WorkLockManagerHandle,
         rack_profiles: RackProfileConfig,
-        rms_client: Option<Arc<dyn RmsApi>>,
+        machine_info_provider: Option<Arc<dyn MachineInfoProvider>>,
         credential_manager: Arc<dyn CredentialManager>,
+        dpf_enabled_at_site: bool,
     ) -> Self {
         // We want to hold metrics for longer than the iteration interval, so there is continuity
         // in emitting metrics. However we want to avoid reporting outdated metrics in case
@@ -545,8 +653,9 @@ impl SiteExplorer {
                 explorer_config.clone(),
                 common_pools,
                 rack_profiles,
-                rms_client.clone(),
+                machine_info_provider,
                 credential_manager,
+                dpf_enabled_at_site,
             ),
             switch_creator: SwitchCreator::new(
                 database_connection.clone(),
@@ -1212,6 +1321,26 @@ impl SiteExplorer {
             }
         }
 
+        let reconcile_machine_locations_start = Instant::now();
+        let host_bmc_ips = identified_hosts
+            .iter()
+            .map(|identified| identified.explored_host.host_bmc_ip)
+            .collect::<Vec<_>>();
+        if let Err(error) = self
+            .machine_creator
+            .reconcile_machine_locations(&host_bmc_ips)
+            .await
+        {
+            tracing::warn!(
+                %error,
+                "Machine RMS location reconciliation failed; a later Site Explorer run will retry"
+            );
+        }
+        metrics.record_phase_latency(
+            "reconcile_machine_locations",
+            reconcile_machine_locations_start.elapsed(),
+        );
+
         Ok(identified_hosts
             .into_iter()
             .map(|identified| (identified.explored_host, identified.report))
@@ -1441,6 +1570,12 @@ impl SiteExplorer {
         let explored_endpoints =
             db::explored_endpoints::find_all_preingestion_complete(&mut txn).await?;
 
+        // Ingested BMC IPs are read once for the whole loop rather than per endpoint.
+        // The iteration work lock makes site-explorer the only writer that ingests
+        // machines, so nothing can become ingested while the loop below runs.
+        let already_ingested_bmc_ips =
+            db::machine_topology::find_all_ingested_bmc_ips(&mut txn).await?;
+
         txn.commit().await?;
 
         let mut explored_dpus = HashMap::new();
@@ -1472,10 +1607,13 @@ impl SiteExplorer {
             }
 
             if ep.report.is_dpu() {
-                if self.can_ingest_dpu_endpoint(metrics, &ep).await? {
+                if self.can_ingest_dpu_endpoint(metrics, &ep, &already_ingested_bmc_ips)? {
                     explored_dpus.insert(ep.address, ep);
                 }
-            } else if self.can_ingest_host_endpoint(metrics, &ep).await? {
+            } else if self
+                .can_ingest_host_endpoint(metrics, &ep, &already_ingested_bmc_ips)
+                .await?
+            {
                 explored_hosts.insert(ep.address, ep);
             }
         }
@@ -1741,11 +1879,9 @@ impl SiteExplorer {
                         if expected_managed_dpus_total > 0 {
                             tracing::warn!(
                                 bmc_ip_address = %ep.address,
-                                exploration_report = ?ep,
                                 discovered_dpu_count = dpus_explored_for_host.len(),
                                 expected_managed_dpu_count = expected_managed_dpus_total,
                                 all_dpus_configured_properly_in_host,
-                                discovered_dpu_details = ?dpus_explored_for_host,
                                 "cannot identify managed host because the site explorer has not discovered all attached DPUs"
                             );
                         }
@@ -2317,6 +2453,7 @@ impl SiteExplorer {
         for suppression in suppressions
             .iter()
             .filter(|suppression| suppression.acknowledged_at.is_none())
+            .unique_by(|suppression| suppression.bmc_mac_address)
         {
             let bmc_ips = db::machine_interface::lookup_bmc_ip_by_mac_address(
                 &self.database_connection,
@@ -2407,12 +2544,9 @@ impl SiteExplorer {
             .map(|sku| (sku.id, sku.device_type))
             .collect();
 
-        // Record Expected Machine metrics and apply configured address
-        // policies. Every role uses `try_apply_expected_interface`; its role
-        // only determines the row's interface type and primary setting. Fixed
-        // addresses create rows when needed, while Retained changes a matching
-        // DHCP address to `Static`. The database helpers are idempotent, so
-        // steady-state passes do not change rows.
+        // Record Expected Machine metrics and create initial Fixed
+        // reservations. DHCP inserts Retained allocations as `Static`; later
+        // inventory passes leave existing allocation types unchanged.
         let preallocate_start = Instant::now();
         for expected_machine in &expected_machines {
             let device_type = expected_machine
@@ -2444,6 +2578,7 @@ impl SiteExplorer {
             let host_bmc = expected_machine.effective_host_bmc();
             try_apply_expected_interface(
                 &self.database_connection,
+                expected_machine,
                 &host_bmc,
                 self.config.retained_boot_interface_window,
             )
@@ -2456,6 +2591,7 @@ impl SiteExplorer {
             {
                 try_apply_expected_interface(
                     &self.database_connection,
+                    expected_machine,
                     nic,
                     self.config.retained_boot_interface_window,
                 )
@@ -2549,20 +2685,46 @@ impl SiteExplorer {
             .iter()
             .map(|machine| machine.bmc_mac_address)
             .collect::<HashSet<_>>();
+        let expected_bmc_macs = expected_machines
+            .iter()
+            .map(|machine| machine.bmc_mac_address)
+            .chain(
+                expected_switches
+                    .iter()
+                    .map(|switch| switch.bmc_mac_address),
+            )
+            .chain(
+                expected_power_shelves
+                    .iter()
+                    .map(|power_shelf| power_shelf.bmc_mac_address),
+            )
+            .collect::<HashSet<_>>();
         let expected_non_redfish_interface_macs = expected_machines
             .iter()
             .flat_map(|machine| &machine.data.interfaces)
             .filter(|interface| {
-                should_skip_expected_interface_redfish_scan(interface, &expected_host_bmc_macs)
+                // A DpuOs interface terminates on the DPU operating system,
+                // not its management controller. Redfish is exposed through
+                // the separate DpuBmc interface.
+                interface.role == model::expected_machine::ExpectedInterfaceRole::DpuOs
             })
             .map(|interface| interface.mac_address)
+            .chain(
+                expected_switches
+                    .iter()
+                    .flat_map(|switch| &switch.nvos_mac_addresses)
+                    .copied(),
+            )
+            // An explicit BMC identity wins if legacy data assigns the same
+            // MAC address to both a BMC and an OS interface.
+            .filter(|mac_address| !expected_bmc_macs.contains(mac_address))
             .collect::<HashSet<_>>();
 
         // Tenant and Admin segments are never Redfish discovery networks. The
-        // Underlay may contain DPU OS data interfaces, so keep explicit DPU OS
-        // MACs out of the scan unless that MAC is an ExpectedMachine BMC
-        // identity. Host remains the compatibility default for legacy entries,
-        // and DPU BMC interfaces remain eligible.
+        // Underlay may contain DPU OS and switch NVOS data interfaces, so keep
+        // their explicit MACs out of the scan unless a MAC is also an expected
+        // BMC identity. Host remains the compatibility default for legacy
+        // ExpectedMachine entries, and DPU BMC interfaces remain eligible.
         //
         // Load interfaces after allocation reconciliation so this iteration
         // also sees newly-created fixed reservations.
@@ -2579,13 +2741,11 @@ impl SiteExplorer {
         let scannable_interfaces: Vec<MachineInterfaceSnapshot> = interfaces
             .into_iter()
             .filter(|iface| {
-                let is_bmc = iface.interface_type == InterfaceType::Bmc;
                 // On Underlay an unadopted interface is a BMC to explore, and adopted BMCs
                 // stay visible too.
                 let underlay = underlay_segments.contains(&iface.segment_id)
-                    && (is_bmc
-                        || (iface.machine_id.is_none()
-                            && !expected_non_redfish_interface_macs.contains(&iface.mac_address)));
+                    && !expected_non_redfish_interface_macs.contains(&iface.mac_address)
+                    && (iface.interface_type == InterfaceType::Bmc || iface.machine_id.is_none());
                 // Host data interfaces also DHCP on HostInband. Only scan BMC
                 // rows plus an anonymous row at an ExpectedMachine BMC identity,
                 // which covers historical rows that were left typed as Data.
@@ -2619,8 +2779,8 @@ impl SiteExplorer {
         // information about the endpoint
         let plan_start = Instant::now();
         let mut delete_endpoints = Vec::new();
-        let mut priority_update_endpoints = Vec::new();
-        let mut update_endpoints = Vec::with_capacity(index.explored_endpoints().len());
+        let mut candidates: Vec<Candidate<'_>> =
+            Vec::with_capacity(index.explored_endpoints().len());
         for (address, endpoint) in index.explored_endpoints() {
             match index.underlay_interface(address) {
                 Some(iface) => {
@@ -2628,30 +2788,17 @@ impl SiteExplorer {
                         tracing::info!(bmc_ip_address = %address, bmc_mac_address = %iface.mac_address, "Skipping exploration of suppressed BMC");
                         continue;
                     }
-
-                    if endpoint.exploration_requested {
-                        priority_update_endpoints.push((*address, iface, endpoint));
-                    } else {
-                        update_endpoints.push((*address, iface, endpoint));
-                    }
+                    candidates.push((*address, iface, endpoint));
                 }
                 None => {
                     if endpoint.report.is_power_shelf() {
-                        tracing::info!(bmc_ip_address = %address, "Retaining power shelf endpoint with no underlay interface; power shelves are sourced from their expected static IP")
+                        tracing::info!(bmc_ip_address = %address, "Retaining power shelf endpoint with no underlay interface; power shelves are sourced from their expected static IP");
                     } else {
                         delete_endpoints.push(*address)
                     }
                 }
             }
         }
-        metrics.record_update_explored_endpoints_count(
-            "priority_update_candidates",
-            priority_update_endpoints.len(),
-        );
-        metrics.record_update_explored_endpoints_count(
-            "routine_update_candidates",
-            update_endpoints.len(),
-        );
         metrics.record_update_explored_endpoints_count(
             "stale_delete_candidates",
             delete_endpoints.len(),
@@ -2686,86 +2833,44 @@ impl SiteExplorer {
                 true
             })
             .collect::<Vec<_>>();
-        metrics.record_update_explored_endpoints_count(
-            "unexplored_candidates",
-            unexplored_endpoints.len(),
+        let plan = plan_explorations(
+            candidates,
+            unexplored_endpoints,
+            self.config.explorations_per_run as usize,
         );
-        // Now that we gathered the candidates for exploration, let's decide what
-        // we are actually going to explore. The config limits the amount of explorations
-        // per iteration.
-        let num_explore_endpoints = (self.config.explorations_per_run as usize)
-            .min(unexplored_endpoints.len() + update_endpoints.len());
-
-        let mut explore_endpoint_data =
-            Vec::with_capacity(priority_update_endpoints.len() + num_explore_endpoints);
-
-        // Existing endpoints with `exploration_requested` are enqueued
-        // unconditionally and sit outside the per-iteration count budget.
-        // Operators set this flag to request a guaranteed next-tick attempt, so
-        // we must not let the routine refresh budget delay them. Concurrency is
-        // still bounded by the `concurrent_explorations` semaphore below.
-        for (address, iface, endpoint) in priority_update_endpoints {
-            explore_endpoint_data.push(Endpoint {
-                address,
-                iface,
-                last_explored: Some(endpoint),
-                pause_ingestion_and_poweron: endpoint.pause_ingestion_and_poweron,
-                expected: index.matched_expected(&address),
-            });
+        for (kind, count) in plan.counts() {
+            metrics.record_update_explored_endpoints_count(kind, count);
         }
 
-        let priority_selected_count = explore_endpoint_data.len();
-        metrics.record_update_explored_endpoints_count(
-            "selected_priority_updates",
-            priority_selected_count,
-        );
-
-        // Next priority are all endpoints that we've never looked at
-        let remaining_explore_endpoints = num_explore_endpoints;
-        for (address, iface) in unexplored_endpoints
-            .iter()
-            .take(remaining_explore_endpoints)
-        {
+        let mut explore_endpoint_data = Vec::with_capacity(plan.selected_total());
+        let ExplorationPlan {
+            priority,
+            unexplored,
+            refresh_waits,
+            routine,
+            ..
+        } = plan;
+        let explored = |(address, iface, endpoint)| Endpoint {
+            address,
+            iface,
+            last_explored: Some(endpoint),
+            pause_ingestion_and_poweron: endpoint.pause_ingestion_and_poweron,
+            expected: index.matched_expected(&address),
+        };
+        explore_endpoint_data.extend(priority.into_iter().map(explored));
+        for (address, iface) in unexplored {
             let pause_ingestion_and_poweron =
                 pause_ingestion_and_poweron(index.expected(), &iface.mac_address);
             explore_endpoint_data.push(Endpoint {
-                address: *address,
+                address,
                 iface,
                 last_explored: None,
                 pause_ingestion_and_poweron,
-                expected: index.matched_expected(address),
+                expected: index.matched_expected(&address),
             });
         }
-        let selected_unexplored = explore_endpoint_data.len() - priority_selected_count;
-        metrics.record_update_explored_endpoints_count("selected_unexplored", selected_unexplored);
-
-        // If we have any capacity available, we update knowledge about endpoints we looked at earlier on
-        let remaining_explore_endpoints =
-            num_explore_endpoints - (explore_endpoint_data.len() - priority_selected_count);
-        if remaining_explore_endpoints != 0 {
-            // Sort endpoints so that we will replace the oldest report first
-            update_endpoints.sort_by_key(|(_address, _machine_interface, endpoint)| {
-                endpoint.report_version.timestamp()
-            });
-            for (address, iface, endpoint) in update_endpoints
-                .into_iter()
-                .take(remaining_explore_endpoints)
-            {
-                explore_endpoint_data.push(Endpoint {
-                    address,
-                    iface,
-                    last_explored: Some(endpoint),
-                    pause_ingestion_and_poweron: endpoint.pause_ingestion_and_poweron,
-                    expected: index.matched_expected(&address),
-                });
-            }
-        }
-        metrics.record_update_explored_endpoints_count(
-            "selected_routine_updates",
-            explore_endpoint_data.len() - priority_selected_count - selected_unexplored,
-        );
-        metrics
-            .record_update_explored_endpoints_count("selected_total", explore_endpoint_data.len());
+        explore_endpoint_data.extend(refresh_waits.into_iter().map(explored));
+        explore_endpoint_data.extend(routine.into_iter().map(explored));
         metrics.record_phase_latency("update_explored_endpoints_plan", plan_start.elapsed());
 
         let task_set = FuturesUnordered::new();
@@ -2921,6 +3026,9 @@ impl SiteExplorer {
         metrics.record_update_explored_endpoints_count("endpoint_error_update_attempts", 0);
         metrics.record_update_explored_endpoints_count("firmware_version_update_attempts", 0);
         metrics.record_update_explored_endpoints_count("redfish_remediation_candidates", 0);
+        // Commit the whole batch before dispatching remediation. A later write
+        // failure must roll back earlier reports and request clearing, since it
+        // also discards the remediation collected for them.
         let mut txn = self.txn_begin().await?;
 
         let mut redfish_errors = Vec::new();
@@ -2962,6 +3070,10 @@ impl SiteExplorer {
                 }
             }
 
+            // Keep topology writes ahead of endpoint writes to match machine deletion's
+            // lock order. A savepoint lets a rejected report undo only its own topology.
+            let mut txn = db::Transaction::begin_inner(txn.as_pgconn()).await?;
+
             // Update possible stale machine versions
             // Configured firmware versions remain the preferred source. Hosts
             // without firmware-management configuration, such as Lenovo GB300
@@ -3000,7 +3112,7 @@ impl SiteExplorer {
                                     "Initial exploration of endpoint"
                                 );
                             }
-                            db::explored_endpoints::try_update(
+                            let report_write = db::explored_endpoints::try_update(
                                 address,
                                 old_version,
                                 &report,
@@ -3009,18 +3121,37 @@ impl SiteExplorer {
                             )
                             .await?;
                             endpoint_report_update_attempts += 1;
+                            match report_write {
+                                ConditionalWrite::Applied(()) => {}
+                                ConditionalWrite::NotApplied(EndpointReportNotCurrent) => {
+                                    // Skip transient remediation: it would use
+                                    // the rejected report's stale endpoint snapshot.
+                                    txn.rollback().await?;
+                                    continue;
+                                }
+                            }
                         }
                         Err(e) => {
                             // If an endpoint can not be explored we don't delete the known information, since it's
                             // still helpful. The failure might just be intermittent.
-                            db::explored_endpoints::try_update_last_exploration_error(
-                                address,
-                                old_version,
-                                &e,
-                                exploration_duration,
-                                &mut txn,
-                            )
-                            .await?;
+                            let error_write =
+                                db::explored_endpoints::try_update_last_exploration_error(
+                                    address,
+                                    old_version,
+                                    &e,
+                                    exploration_duration,
+                                    &mut txn,
+                                )
+                                .await?;
+                            match error_write {
+                                ConditionalWrite::Applied(()) => {}
+                                ConditionalWrite::NotApplied(EndpointReportNotCurrent) => {
+                                    // The endpoint disappeared or its report changed
+                                    // while we were probing. Don't remediate an error
+                                    // the database didn't accept.
+                                    redfish_error = None;
+                                }
+                            }
                             endpoint_error_update_attempts += 1;
                         }
                     }
@@ -3073,6 +3204,8 @@ impl SiteExplorer {
                     }
                 }
             }
+
+            txn.commit().await?;
 
             // We wait until the end to add it to redfish_errors so we can move endpoint safely
             if let Some(e) = redfish_error {
@@ -3551,28 +3684,16 @@ impl SiteExplorer {
 
     /// can_ingest_dpu_endpoint returns a boolean indicating whether the site explorer should continue ingesting a DPU endpoint.
     /// it will always return true for a DPU that has already been ingested.
-    async fn can_ingest_dpu_endpoint(
+    ///
+    /// `already_ingested_bmc_ips` is the caller's snapshot of ingested BMC IPs, so
+    /// this decision costs no database round trip per endpoint.
+    fn can_ingest_dpu_endpoint(
         &self,
         metrics: &mut SiteExplorationMetrics,
         dpu_endpoint: &ExploredEndpoint,
+        already_ingested_bmc_ips: &HashSet<IpAddr>,
     ) -> SiteExplorerResult<bool> {
-        let is_managed_host_created_for_endpoint = match self
-            .is_managed_host_created_for_endpoint(dpu_endpoint.address)
-            .await
-        {
-            Ok(managed_host_exists) => managed_host_exists,
-            Err(e) => {
-                tracing::error!(
-                    %dpu_endpoint,
-                    error = %e,
-                    "Failed to determine whether managed host was created"
-                );
-                // return true by default
-                true
-            }
-        };
-
-        if is_managed_host_created_for_endpoint {
+        if already_ingested_bmc_ips.contains(&dpu_endpoint.address) {
             // this dpu has already been ingested
             return Ok(true);
         }
@@ -3721,28 +3842,16 @@ impl SiteExplorer {
     /// If the host has not been ingested, is a Lenovo,  and infinite boot is disabled, the function will try to enable
     /// infinite boot and return false.
     /// Otherwise, the function will return true.
+    ///
+    /// `already_ingested_bmc_ips` is the caller's snapshot of ingested BMC IPs, so
+    /// this decision costs no database round trip per endpoint.
     async fn can_ingest_host_endpoint(
         &self,
         metrics: &mut SiteExplorationMetrics,
         host_endpoint: &ExploredEndpoint,
+        already_ingested_bmc_ips: &HashSet<IpAddr>,
     ) -> SiteExplorerResult<bool> {
-        let is_managed_host_created_for_endpoint = match self
-            .is_managed_host_created_for_endpoint(host_endpoint.address)
-            .await
-        {
-            Ok(managed_host_exists) => managed_host_exists,
-            Err(e) => {
-                tracing::error!(
-                    %host_endpoint,
-                    error = %e,
-                    "Failed to determine whether managed host was created"
-                );
-                // return true by default
-                true
-            }
-        };
-
-        if is_managed_host_created_for_endpoint {
+        if already_ingested_bmc_ips.contains(&host_endpoint.address) {
             // this host has already been ingested
             return Ok(true);
         }
@@ -4123,58 +4232,93 @@ pub async fn try_preallocate_one(
 /// `try_apply_expected_interface` applies the allocation policy for one
 /// configured or compatibility-derived expected interface.
 ///
-/// Every role follows this same policy path. Fixed reservations are
-/// materialized while expected configuration is reconciled. Retained follows
-/// the existing Host BMC behavior: a matching DHCP address becomes `Static`
-/// for this interface row's lifetime, but the selected address is not written
-/// back to `ExpectedMachine` for a later re-ingestion. Dynamic needs no
-/// reconciliation here.
+/// Fixed reservations apply only before that family's first stateful
+/// allocation. Dynamic and Retained allocations are created by DHCP, so
+/// neither requires reconciliation here.
 ///
 /// Each interface gets its own transaction so one invalid reservation cannot
 /// stop Site Explorer from processing the remaining expected inventory.
+///
+/// The captured `expected_machine` must identify a stored row. Its declaration
+/// is revalidated under a lock held through the address write and commit.
+/// Deleted or changed declarations are skipped; the next inventory pass reads
+/// the new configuration.
 pub async fn try_apply_expected_interface(
     pool: &PgPool,
+    expected_machine: &ExpectedMachine,
     expected_interface: &ExpectedInterface,
     retained_window: Option<chrono::Duration>,
 ) {
-    let allocation = expected_interface.resolved_ip_allocation();
-    let mut txn = match allocation {
-        ExpectedInterfaceIpAllocation::Dynamic => return,
-        ExpectedInterfaceIpAllocation::Fixed | ExpectedInterfaceIpAllocation::Retained => {
-            match db::Transaction::begin(pool).await {
-                Ok(txn) => txn,
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        mac_address = %expected_interface.mac_address,
-                        "Site-explorer expected-interface allocation: txn_begin failed"
-                    );
-                    return;
-                }
-            }
+    if expected_interface.resolved_ip_allocation() != ExpectedInterfaceIpAllocation::Fixed {
+        return;
+    }
+    let mut txn = match db::Transaction::begin(pool).await {
+        Ok(txn) => txn,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                mac_address = %expected_interface.mac_address,
+                "Site-explorer expected-interface allocation: txn_begin failed"
+            );
+            return;
         }
     };
 
-    let result = match allocation {
-        ExpectedInterfaceIpAllocation::Dynamic => {
-            unreachable!("dynamic allocation returns before opening a transaction")
+    // The inventory snapshot was read in an earlier transaction. Keep this
+    // lock through allocation so an edit or deletion cannot commit between
+    // validating the declaration and writing a `Static` address.
+    let current = match db::expected_machine::find_for_update(
+        txn.as_pgconn(),
+        &ExpectedMachineRequest {
+            id: expected_machine.id,
+            bmc_mac_address: None,
+        },
+    )
+    .await
+    {
+        Ok(Some(current)) => current,
+        Ok(None) => {
+            txn.rollback_or_log("expected machine deleted before allocation")
+                .await;
+            return;
         }
-        ExpectedInterfaceIpAllocation::Fixed => {
-            db::machine_interface::preallocate_expected_machine_interface(
-                txn.as_pgconn(),
-                expected_interface,
-                retained_window,
-            )
-            .await
-        }
-        ExpectedInterfaceIpAllocation::Retained => {
-            db::machine_interface::retain_expected_machine_interface_address(
-                txn.as_pgconn(),
-                expected_interface,
-            )
-            .await
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                expected_machine_id = ?expected_machine.id,
+                mac_address = %expected_interface.mac_address,
+                "Site-explorer expected-interface allocation: configuration lookup failed"
+            );
+            txn.rollback_or_log("expected interface allocation lookup failed")
+                .await;
+            return;
         }
     };
+
+    let declaration_matches = if expected_interface.mac_address == current.bmc_mac_address {
+        current.effective_host_bmc() == *expected_interface
+    } else {
+        current.data.interfaces.contains(expected_interface)
+    };
+    // Replace-all can reuse an ID for a different BMC MAC. That must not
+    // authorize a declaration captured for the previous owner.
+    if current.bmc_mac_address != expected_machine.bmc_mac_address || !declaration_matches {
+        tracing::debug!(
+            expected_machine_id = ?expected_machine.id,
+            mac_address = %expected_interface.mac_address,
+            "Site-explorer expected-interface allocation: owner or declaration changed, skipping"
+        );
+        txn.rollback_or_log("expected owner or interface declaration changed before allocation")
+            .await;
+        return;
+    }
+
+    let result = db::machine_interface::preallocate_expected_machine_interface(
+        txn.as_pgconn(),
+        expected_interface,
+        retained_window,
+    )
+    .await;
 
     match result {
         Ok(()) => {
@@ -4769,9 +4913,8 @@ mod tests {
     use carbide_test_support::Outcome::*;
     use carbide_test_support::{Case, Check, check_cases, check_values, value_scenarios};
     use config_version::ConfigVersion;
-    use model::expected_machine::ExpectedInterfaceRole;
     use model::site_explorer::{
-        ComputerSystem, Inventory, NetworkAdapter, PreingestionState, Service,
+        ComputerSystem, InitialBmcResetPhase, Inventory, NetworkAdapter, PreingestionState, Service,
     };
 
     use super::*;
@@ -4913,57 +5056,6 @@ mod tests {
                 },
             ],
             rms_location_value,
-        );
-    }
-
-    /// Only an explicit DPU OS role suppresses Redfish scanning.
-    ///
-    /// Host remains eligible because it is the default for legacy entries
-    /// that did not declare an interface role. The ExpectedMachine BMC key
-    /// takes precedence over a historical conflicting DPU OS declaration.
-    #[test]
-    fn expected_interface_role_controls_redfish_scan_classification() {
-        let host_bmc_mac_address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
-        let other_mac_address = "AA:BB:CC:DD:EE:FE".parse().unwrap();
-        let expected_host_bmc_macs = HashSet::from([host_bmc_mac_address]);
-        check_values(
-            [
-                Check {
-                    scenario: "legacy host entry",
-                    input: (ExpectedInterfaceRole::Host, other_mac_address),
-                    expect: false,
-                },
-                Check {
-                    scenario: "DPU OS interface",
-                    input: (ExpectedInterfaceRole::DpuOs, other_mac_address),
-                    expect: true,
-                },
-                Check {
-                    scenario: "DPU BMC interface",
-                    input: (ExpectedInterfaceRole::DpuBmc, other_mac_address),
-                    expect: false,
-                },
-                Check {
-                    scenario: "Host BMC interface",
-                    input: (ExpectedInterfaceRole::HostBmc, host_bmc_mac_address),
-                    expect: false,
-                },
-                Check {
-                    scenario: "historical DPU OS declaration at any ExpectedMachine BMC identity",
-                    input: (ExpectedInterfaceRole::DpuOs, host_bmc_mac_address),
-                    expect: false,
-                },
-            ],
-            |(role, mac_address)| {
-                should_skip_expected_interface_redfish_scan(
-                    &ExpectedInterface {
-                        mac_address,
-                        role,
-                        ..Default::default()
-                    },
-                    &expected_host_bmc_macs,
-                )
-            },
         );
     }
 
@@ -5550,6 +5642,337 @@ mod tests {
             pause_remediation: false,
             boot_interface_mac: None,
             boot_interface_id: None,
+        }
+    }
+
+    /// A candidate for `plan_explorations`: an explored endpoint at `address`
+    /// whose report carries `version`, with the interface it is probed through.
+    fn planned(
+        address: &str,
+        state: PreingestionState,
+        waiting: bool,
+        requested: bool,
+        version: ConfigVersion,
+    ) -> (ExploredEndpoint, MachineInterfaceSnapshot) {
+        let mut endpoint = explored_endpoint(EndpointExplorationReport::default());
+        endpoint.address = address.parse().unwrap();
+        endpoint.preingestion_state = state;
+        endpoint.waiting_for_explorer_refresh = waiting;
+        endpoint.exploration_requested = requested;
+        endpoint.report_version = version;
+        let iface = MachineInterfaceSnapshot::mock_with_mac(MacAddress::new([2, 0, 0, 0, 0, 1]));
+        (endpoint, iface)
+    }
+
+    /// A report version whose timestamp is `micros` after the epoch.
+    fn version_at(micros: i64) -> ConfigVersion {
+        format!("V1-T{micros}").parse().unwrap()
+    }
+
+    fn addresses<T>(selected: &[T], address: impl Fn(&T) -> IpAddr) -> Vec<IpAddr> {
+        selected.iter().map(address).collect()
+    }
+
+    #[test]
+    fn allocate_gives_each_tier_its_share_and_passes_unused_slots_on() {
+        let counts = |unexplored, refresh_waits, routine| TierCounts {
+            unexplored,
+            refresh_waits,
+            routine,
+        };
+        // input: (budget, candidates per tier); expect: slots per tier
+        check_values(
+            [
+                Check {
+                    scenario: "every tier full: 70/20/10",
+                    input: (10, counts(20, 20, 20)),
+                    expect: counts(7, 2, 1),
+                },
+                Check {
+                    scenario: "no unexplored: its share flows to refresh waits, then routine",
+                    input: (10, counts(0, 5, 20)),
+                    expect: counts(0, 5, 5),
+                },
+                Check {
+                    scenario: "no candidates for the later tiers: unexplored takes everything",
+                    input: (10, counts(20, 0, 0)),
+                    expect: counts(10, 0, 0),
+                },
+                Check {
+                    scenario: "the rounding leftover of a small budget goes to unexplored",
+                    input: (1, counts(1, 1, 1)),
+                    expect: counts(1, 0, 0),
+                },
+                Check {
+                    scenario: "fewer candidates than budget: all of them",
+                    input: (10, counts(1, 1, 1)),
+                    expect: counts(1, 1, 1),
+                },
+            ],
+            |(budget, candidates)| allocate(budget, candidates),
+        );
+    }
+
+    #[test]
+    fn plan_explorations_spends_the_budget_by_tier() {
+        let parked = || PreingestionState::InitialBMCReset {
+            phase: InitialBmcResetPhase::WaitForExplorerRefresh,
+        };
+        struct Case {
+            name: &'static str,
+            // (address, state, waiting, requested, report timestamp in micros)
+            explored: Vec<(&'static str, PreingestionState, bool, bool, i64)>,
+            // (address, interface creation time in seconds)
+            unexplored: Vec<(&'static str, i64)>,
+            budget: usize,
+            priority: Vec<&'static str>,
+            selected_unexplored: Vec<&'static str>,
+            refresh_waits: Vec<&'static str>,
+            routine: Vec<&'static str>,
+        }
+        let cases = [
+            Case {
+                name: "an operator request is served outside the budget even when parked",
+                explored: vec![
+                    ("10.0.0.1", parked(), true, true, 10),
+                    ("10.0.0.2", PreingestionState::Complete, false, false, 20),
+                ],
+                unexplored: vec![],
+                budget: 0,
+                priority: vec!["10.0.0.1"],
+                selected_unexplored: vec![],
+                refresh_waits: vec![],
+                routine: vec![],
+            },
+            Case {
+                name: "during bring-up unexplored endpoints get 70 percent, oldest interface first, and the other tiers keep theirs",
+                explored: vec![
+                    ("10.0.0.1", parked(), true, false, 10),
+                    ("10.0.0.2", parked(), true, false, 11),
+                    ("10.0.0.3", parked(), true, false, 12),
+                    ("10.0.0.4", PreingestionState::Complete, false, false, 13),
+                    ("10.0.0.5", PreingestionState::Complete, false, false, 14),
+                ],
+                unexplored: vec![
+                    ("10.0.1.1", 300),
+                    ("10.0.1.2", 100),
+                    ("10.0.1.3", 200),
+                    ("10.0.1.4", 400),
+                    ("10.0.1.5", 500),
+                    ("10.0.1.6", 600),
+                    ("10.0.1.7", 700),
+                    ("10.0.1.8", 800),
+                    ("10.0.1.9", 900),
+                ],
+                budget: 10,
+                priority: vec![],
+                selected_unexplored: vec![
+                    "10.0.1.2", "10.0.1.3", "10.0.1.1", "10.0.1.4", "10.0.1.5", "10.0.1.6",
+                    "10.0.1.7",
+                ],
+                refresh_waits: vec!["10.0.0.1", "10.0.0.2"],
+                routine: vec!["10.0.0.4"],
+            },
+            Case {
+                name: "slots unexplored endpoints cannot use flow to refresh waits, then routine",
+                explored: vec![
+                    ("10.0.0.1", parked(), true, false, 10),
+                    ("10.0.0.2", parked(), true, false, 11),
+                    ("10.0.0.3", parked(), true, false, 12),
+                    ("10.0.0.4", PreingestionState::Complete, false, false, 13),
+                    ("10.0.0.5", PreingestionState::Complete, false, false, 14),
+                ],
+                unexplored: vec![("10.0.1.1", 100)],
+                budget: 5,
+                priority: vec![],
+                selected_unexplored: vec!["10.0.1.1"],
+                refresh_waits: vec!["10.0.0.1", "10.0.0.2", "10.0.0.3"],
+                routine: vec!["10.0.0.4"],
+            },
+            Case {
+                name: "a refresh wait is served before an older routine report when the budget is one",
+                explored: vec![
+                    ("10.0.0.1", PreingestionState::Complete, false, false, 10),
+                    ("10.0.0.2", parked(), true, false, 20),
+                ],
+                unexplored: vec![],
+                budget: 1,
+                priority: vec![],
+                selected_unexplored: vec![],
+                refresh_waits: vec!["10.0.0.2"],
+                routine: vec![],
+            },
+            Case {
+                name: "refresh waits are served oldest report first, so a failed probe rotates to the back",
+                explored: vec![
+                    ("10.0.0.1", parked(), true, false, 30),
+                    ("10.0.0.2", parked(), true, false, 10),
+                    ("10.0.0.3", parked(), true, false, 20),
+                ],
+                unexplored: vec![],
+                budget: 2,
+                priority: vec![],
+                selected_unexplored: vec![],
+                refresh_waits: vec!["10.0.0.2", "10.0.0.3"],
+                routine: vec![],
+            },
+            Case {
+                name: "a wave of parked BMCs leaves the routine refresh its 10 percent",
+                explored: vec![
+                    ("10.0.0.1", parked(), true, false, 10),
+                    ("10.0.0.2", parked(), true, false, 11),
+                    ("10.0.0.3", parked(), true, false, 12),
+                    ("10.0.0.4", parked(), true, false, 13),
+                    ("10.0.0.5", parked(), true, false, 14),
+                    ("10.0.0.6", parked(), true, false, 15),
+                    ("10.0.0.7", parked(), true, false, 16),
+                    ("10.0.0.8", parked(), true, false, 17),
+                    ("10.0.0.9", parked(), true, false, 18),
+                    ("10.0.0.10", parked(), true, false, 19),
+                    ("10.0.0.11", PreingestionState::Complete, false, false, 20),
+                    ("10.0.0.12", PreingestionState::Complete, false, false, 21),
+                ],
+                unexplored: vec![],
+                budget: 10,
+                priority: vec![],
+                selected_unexplored: vec![],
+                refresh_waits: vec![
+                    "10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.0.5", "10.0.0.6",
+                    "10.0.0.7", "10.0.0.8", "10.0.0.9",
+                ],
+                routine: vec!["10.0.0.11"],
+            },
+            Case {
+                name: "only the states that read the next report are refresh waits",
+                explored: vec![
+                    (
+                        "10.0.0.1",
+                        PreingestionState::RecheckVersions,
+                        true,
+                        false,
+                        10,
+                    ),
+                    (
+                        "10.0.0.2",
+                        PreingestionState::NewFirmwareReportedWait {
+                            final_version: "1.0".to_string(),
+                            upgrade_type: FirmwareComponentType::Bmc,
+                            previous_reset_time: None,
+                        },
+                        true,
+                        false,
+                        11,
+                    ),
+                    (
+                        "10.0.0.3",
+                        PreingestionState::RecheckVersionsAfterFailure {
+                            reason: "job failed".to_string(),
+                        },
+                        true,
+                        false,
+                        12,
+                    ),
+                    (
+                        "10.0.0.4",
+                        PreingestionState::InitialBMCReset {
+                            phase: InitialBmcResetPhase::WaitForBmc,
+                        },
+                        true,
+                        false,
+                        13,
+                    ),
+                    ("10.0.0.5", PreingestionState::Initial, true, false, 14),
+                    ("10.0.0.6", PreingestionState::Complete, true, false, 15),
+                    (
+                        "10.0.0.7",
+                        PreingestionState::Failed {
+                            reason: "bmc never answered".to_string(),
+                        },
+                        true,
+                        false,
+                        16,
+                    ),
+                ],
+                unexplored: vec![],
+                budget: 7,
+                priority: vec![],
+                selected_unexplored: vec![],
+                refresh_waits: vec!["10.0.0.1", "10.0.0.2", "10.0.0.3"],
+                routine: vec!["10.0.0.4", "10.0.0.5", "10.0.0.6", "10.0.0.7"],
+            },
+        ];
+        for case in cases {
+            let explored: Vec<_> = case
+                .explored
+                .iter()
+                .map(|(address, state, waiting, requested, micros)| {
+                    planned(
+                        address,
+                        state.clone(),
+                        *waiting,
+                        *requested,
+                        version_at(*micros),
+                    )
+                })
+                .collect();
+            let unexplored_ifaces: Vec<(IpAddr, MachineInterfaceSnapshot)> = case
+                .unexplored
+                .iter()
+                .map(|(address, created)| {
+                    let mut iface = MachineInterfaceSnapshot::mock_with_mac(MacAddress::new([
+                        2, 0, 0, 0, 0, 2,
+                    ]));
+                    iface.created = chrono::DateTime::from_timestamp(*created, 0).unwrap();
+                    (address.parse().unwrap(), iface)
+                })
+                .collect();
+            let plan = plan_explorations(
+                explored
+                    .iter()
+                    .map(|(endpoint, iface)| (endpoint.address, iface, endpoint))
+                    .collect(),
+                unexplored_ifaces
+                    .iter()
+                    .map(|(address, iface)| (*address, iface))
+                    .collect(),
+                case.budget,
+            );
+            let ips = |list: &[&str]| -> Vec<IpAddr> {
+                list.iter().map(|a| a.parse().unwrap()).collect()
+            };
+            assert_eq!(
+                addresses(&plan.priority, |c| c.0),
+                ips(&case.priority),
+                "{}: priority",
+                case.name
+            );
+            assert_eq!(
+                addresses(&plan.unexplored, |c| c.0),
+                ips(&case.selected_unexplored),
+                "{}: unexplored",
+                case.name
+            );
+            assert_eq!(
+                addresses(&plan.refresh_waits, |c| c.0),
+                ips(&case.refresh_waits),
+                "{}: refresh waits",
+                case.name
+            );
+            assert_eq!(
+                addresses(&plan.routine, |c| c.0),
+                ips(&case.routine),
+                "{}: routine",
+                case.name
+            );
+            assert_eq!(
+                plan.selected_total(),
+                case.priority.len()
+                    + case.selected_unexplored.len()
+                    + case.refresh_waits.len()
+                    + case.routine.len(),
+                "{}: total",
+                case.name
+            );
         }
     }
 

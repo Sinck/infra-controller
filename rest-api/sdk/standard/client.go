@@ -67,15 +67,17 @@ type APIClient struct {
 
 	DPUReprovisionAPI *DPUReprovisionAPIService
 
+	DomainAPI *DomainAPIService
+
 	ExpectedMachineAPI *ExpectedMachineAPIService
 
 	ExpectedPowerShelfAPI *ExpectedPowerShelfAPIService
 
 	ExpectedRackAPI *ExpectedRackAPIService
 
-	ExpectedSwitchAPI *ExpectedSwitchAPIService
+	ExpectedRackGroupAPI *ExpectedRackGroupAPIService
 
-	HealthReportAPI *HealthReportAPIService
+	ExpectedSwitchAPI *ExpectedSwitchAPIService
 
 	HostFirmwareConfigAPI *HostFirmwareConfigAPIService
 
@@ -101,8 +103,6 @@ type APIClient struct {
 
 	MetadataAPI *MetadataAPIService
 
-	NVLinkDomainAPI *NVLinkDomainAPIService
-
 	NVLinkLogicalPartitionAPI *NVLinkLogicalPartitionAPIService
 
 	NetworkSecurityGroupAPI *NetworkSecurityGroupAPIService
@@ -124,6 +124,8 @@ type APIClient struct {
 	SiteAPI *SiteAPIService
 
 	SiteExplorerAPI *SiteExplorerAPIService
+
+	SpectrumXPartitionAPI *SpectrumXPartitionAPIService
 
 	SubnetAPI *SubnetAPIService
 
@@ -174,11 +176,12 @@ func NewAPIClient(cfg *Configuration) *APIClient {
 	c.DPUExtensionServiceAPI = (*DPUExtensionServiceAPIService)(&c.common)
 	c.DPUMachineAPI = (*DPUMachineAPIService)(&c.common)
 	c.DPUReprovisionAPI = (*DPUReprovisionAPIService)(&c.common)
+	c.DomainAPI = (*DomainAPIService)(&c.common)
 	c.ExpectedMachineAPI = (*ExpectedMachineAPIService)(&c.common)
 	c.ExpectedPowerShelfAPI = (*ExpectedPowerShelfAPIService)(&c.common)
 	c.ExpectedRackAPI = (*ExpectedRackAPIService)(&c.common)
+	c.ExpectedRackGroupAPI = (*ExpectedRackGroupAPIService)(&c.common)
 	c.ExpectedSwitchAPI = (*ExpectedSwitchAPIService)(&c.common)
-	c.HealthReportAPI = (*HealthReportAPIService)(&c.common)
 	c.HostFirmwareConfigAPI = (*HostFirmwareConfigAPIService)(&c.common)
 	c.IPBlockAPI = (*IPBlockAPIService)(&c.common)
 	c.IPXETemplateAPI = (*IPXETemplateAPIService)(&c.common)
@@ -191,7 +194,6 @@ func NewAPIClient(cfg *Configuration) *APIClient {
 	c.MeasuredBootTrustedMachineAPI = (*MeasuredBootTrustedMachineAPIService)(&c.common)
 	c.MeasuredBootTrustedProfileAPI = (*MeasuredBootTrustedProfileAPIService)(&c.common)
 	c.MetadataAPI = (*MetadataAPIService)(&c.common)
-	c.NVLinkDomainAPI = (*NVLinkDomainAPIService)(&c.common)
 	c.NVLinkLogicalPartitionAPI = (*NVLinkLogicalPartitionAPIService)(&c.common)
 	c.NetworkSecurityGroupAPI = (*NetworkSecurityGroupAPIService)(&c.common)
 	c.OperatingSystemAPI = (*OperatingSystemAPIService)(&c.common)
@@ -203,6 +205,7 @@ func NewAPIClient(cfg *Configuration) *APIClient {
 	c.ServiceAccountAPI = (*ServiceAccountAPIService)(&c.common)
 	c.SiteAPI = (*SiteAPIService)(&c.common)
 	c.SiteExplorerAPI = (*SiteExplorerAPIService)(&c.common)
+	c.SpectrumXPartitionAPI = (*SpectrumXPartitionAPIService)(&c.common)
 	c.SubnetAPI = (*SubnetAPIService)(&c.common)
 	c.TaskAPI = (*TaskAPIService)(&c.common)
 	c.TaskRunAPI = (*TaskRunAPIService)(&c.common)

@@ -67,7 +67,7 @@ type Machine struct {
 	Labels map[string]string `json:"labels,omitempty"`
 	// Status represents the status of the machine
 	Status *MachineStatus `json:"status,omitempty"`
-	// Indicates whether the machine is usable by or currently in use by a tenant.
+	// Indicates whether the machine is usable by or currently in use by a tenant. It does not indicate that a Machine is available for Instance creation.
 	IsUsableByTenant *bool `json:"isUsableByTenant,omitempty"`
 	// Chronological status history for the Machine
 	StatusHistory []StatusDetail `json:"statusHistory,omitempty"`
@@ -853,7 +853,7 @@ func (o *Machine) GetLabels() map[string]string {
 	return o.Labels
 }
 
-// GetLabelsOk returns a tuple with the Labels field value if set, nil otherwise
+// GetLabelsOk returns a tuple with the Labels field value if set, an empty map otherwise
 // and a boolean to check if the value has been set.
 func (o *Machine) GetLabelsOk() (map[string]string, bool) {
 	if o == nil || IsNil(o.Labels) {
