@@ -40,6 +40,33 @@ tests:
               path: /opt/forge
               type: DirectoryOrCreate
 
+  - it: should mount the DPU fTPM resource manager in the main agent only
+    set:
+      image:
+        repository: test
+        tag: test
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: tpm-resource-manager
+            mountPath: /dev/tpmrm0
+      - notContains:
+          path: spec.template.spec.containers[1].volumeMounts
+          content:
+            name: tpm-resource-manager
+          any: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: tpm-resource-manager
+            hostPath:
+              path: /dev/tpmrm0
+              type: CharDevice
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.privileged
+          value: true
+
   - it: should fall back to /opt/nico when certsDir is cleared
     set:
       image:

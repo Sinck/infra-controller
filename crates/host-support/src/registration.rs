@@ -17,7 +17,9 @@
 
 use std::time::Duration;
 
-use ::rpc::forge::{AttestQuoteRequest, MachineCertificate};
+use ::rpc::forge::{
+    AttestQuoteRequest, MachineCertificate, NodeAuthPublicKey, RegisterNodeAuthKeyRequest,
+};
 use ::rpc::forge_tls_client::{ForgeClientConfig, ForgeClientT, ForgeTlsClient};
 use ::rpc::{MachineDiscoveryInfo, forge as rpc, machine_discovery as rpc_discovery};
 use carbide_uuid::machine::MachineId;
@@ -47,6 +49,10 @@ pub enum RegistrationError {
 pub struct RegistrationData {
     /// The machine ID under which this machine is known in Forge
     pub machine_id: MachineId,
+    /// Present only when node-auth is enabled on the API. The caller must
+    /// answer it with AK-certified TPM signing-key evidence before its JWTs
+    /// are accepted.
+    pub node_auth_key_challenge: Option<rpc::NodeAuthKeyChallenge>,
 }
 
 #[derive(Clone)]
@@ -186,6 +192,20 @@ impl<'a, 'c> RegistrationClient<'a, 'c> {
             .inspect_err(|err| tracing::error!(error = %err, "Error attempting to attest_quote"))?
             .into_inner())
     }
+
+    async fn register_node_auth_key(
+        &self,
+        registration: &RegisterNodeAuthKeyRequest,
+    ) -> Result<(), RegistrationError> {
+        let mut connection = self.connect("register_node_auth_key").await?;
+        connection
+            .register_node_auth_key(tonic::Request::new(registration.clone()))
+            .await
+            .inspect_err(
+                |err| tracing::error!(error = %err, "Error registering node-auth TPM key"),
+            )?;
+        Ok(())
+    }
 }
 
 // create_client_config creates a new ForgeClientConfig. All
@@ -221,6 +241,8 @@ pub async fn register_machine(
     require_client_certificates: bool,
     discovery_reporter: ::rpc::MachineDiscoveryReporter,
     reporter_version: Option<String>,
+    node_auth_public_key: Option<NodeAuthPublicKey>,
+    node_auth_ek_certificate: Option<Vec<u8>>,
 ) -> Result<
     (
         RegistrationData,
@@ -237,6 +259,8 @@ pub async fn register_machine(
         create_machine,
         discovery_reporter: discovery_reporter as i32,
         discovery_reporter_version: reporter_version,
+        node_auth_public_key,
+        node_auth_ek_certificate: node_auth_ek_certificate.unwrap_or_default(),
     };
     tracing::info!(machine_discovery_info = ?info, "register_machine discovery_info");
 
@@ -262,10 +286,31 @@ pub async fn register_machine(
     tracing::info!(%machine_id, "Registered");
 
     Ok((
-        RegistrationData { machine_id },
+        RegistrationData {
+            machine_id,
+            node_auth_key_challenge: response.node_auth_key_challenge,
+        },
         response.attest_key_challenge,
         response.machine_interface_id.map(uuid::Uuid::from),
     ))
+}
+
+/// Completes TPM-backed node-auth key enrollment. The endpoint remains
+/// unauthenticated by design: it is the first credential exchange, and the
+/// EK/AK challenge authenticates the TPM instead of a pre-existing client
+/// certificate.
+pub async fn register_node_auth_key(
+    forge_api: &str,
+    root_ca: String,
+    use_mgmt_vrf: bool,
+    retry: DiscoveryRetry,
+    registration: RegisterNodeAuthKeyRequest,
+) -> Result<(), RegistrationError> {
+    let forge_client_config =
+        create_client_config("register_node_auth_key", use_mgmt_vrf, root_ca)?;
+    RegistrationClient::new(forge_api, &forge_client_config, retry)
+        .register_node_auth_key(&registration)
+        .await
 }
 
 pub async fn attest_quote(

@@ -205,6 +205,10 @@ spec:
             - name: hw-cache
               mountPath: /data
               readOnly: true
+            # The agent signs node-auth tokens with the DPU fTPM. Mount only
+            # the resource-manager device, not the host's complete /dev.
+            - name: tpm-resource-manager
+              mountPath: /dev/tpmrm0
         - name: nico-lldp-sidecar
           securityContext:
             privileged: false
@@ -249,6 +253,10 @@ spec:
             type: DirectoryOrCreate
         - name: hw-cache
           emptyDir: {}
+        - name: tpm-resource-manager
+          hostPath:
+            path: /dev/tpmrm0
+            type: CharDevice
         - name: host-run
           hostPath:
             path: /run

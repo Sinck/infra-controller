@@ -864,6 +864,13 @@ impl Forge for Api {
         crate::handlers::machine_discovery::discover_machine(self, request).await
     }
 
+    async fn register_node_auth_key(
+        &self,
+        request: Request<rpc::RegisterNodeAuthKeyRequest>,
+    ) -> Result<Response<rpc::RegisterNodeAuthKeyResponse>, Status> {
+        crate::handlers::node_auth::register_key(self, request).await
+    }
+
     // Host has completed discovery
     async fn discovery_completed(
         &self,

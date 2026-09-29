@@ -218,6 +218,8 @@ service Forge {
   rpc ForgeAgentControl(ForgeAgentControlRequest) returns (ForgeAgentControlResponse);
   // PRIVILEGED: Creates a new machine from nothing
   rpc DiscoverMachine(MachineDiscoveryInfo) returns (MachineDiscoveryResult);
+  // Completes the TPM-backed node-auth key enrollment started by discovery.
+  rpc RegisterNodeAuthKey(RegisterNodeAuthKeyRequest) returns (RegisterNodeAuthKeyResponse);
   rpc RenewMachineCertificate(MachineCertificateRenewRequest) returns (MachineCertificateResult);
   rpc DiscoveryCompleted(MachineDiscoveryCompletedRequest) returns (MachineDiscoveryCompletedResponse);
   rpc CleanupMachineCompleted(MachineCleanupInfo) returns (MachineCleanupResult);
@@ -1363,6 +1365,25 @@ message AttestQuoteRequest{
 message AttestQuoteResponse{
   bool success = 1;
   MachineCertificate machine_certificate = 2;
+}
+
+// A short-lived challenge sent after discovery. The TPM can recover
+// `credential` only when its EK and AK match the discovery evidence; the
+// recovered bytes are then bound into a TPM2_Certify statement for the
+// node-auth signing key.
+message NodeAuthKeyChallenge {
+  bytes cred_blob = 1;
+  bytes encrypted_secret = 2;
+}
+
+message RegisterNodeAuthKeyRequest {
+  common.MachineId machine_id = 1;
+  bytes credential = 2;
+  bytes attestation = 3;
+  bytes signature = 4;
+}
+
+message RegisterNodeAuthKeyResponse {
 }
 
 enum CredentialType {
@@ -5285,6 +5306,25 @@ message MachineDiscoveryInfo {
   bool create_machine = 3;
   MachineDiscoveryReporter discovery_reporter = 4;
   optional string discovery_reporter_version = 5;
+  // P-256 public key and TPM name for the key that signs node JWTs. The API
+  // only persists it after the NodeAuthKeyChallenge is answered with an AK
+  // certification.
+  NodeAuthPublicKey node_auth_public_key = 6;
+  // EK certificate used only for node-auth enrollment. It is kept outside
+  // DiscoveryInfo so enabling node-auth cannot change a machine's
+  // hardware-derived machine ID.
+  bytes node_auth_ek_certificate = 7;
+}
+
+message NodeAuthPublicKey {
+  string key_id = 1;
+  bytes public_key = 2;
+  bytes key_name = 3;
+  machine_discovery.AttestKeyInfo attest_key_info = 4;
+  // Marshalled TPMT_PUBLIC for the signing key. The API verifies that its
+  // P-256 point and TPM name match the other fields before it vends a
+  // credential challenge.
+  bytes tpm_public = 5;
 }
 
 message MachineDiscoveryCompletedRequest {
@@ -5341,6 +5381,7 @@ message MachineDiscoveryResult {
   AttestKeyBindChallenge attest_key_challenge = 3;
   // Interface id
   common.MachineInterfaceId machine_interface_id = 4;
+  NodeAuthKeyChallenge node_auth_key_challenge = 5;
 }
 
 message MachineDiscoveryCompletedResponse {

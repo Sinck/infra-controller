@@ -17,10 +17,10 @@
 
 //! Node-auth tokens for co-located services that hold no key (issue #355).
 //!
-//! On a DPU, only the dpu-agent holds the machine's private key; other NICo
+//! On a DPU, only the dpu-agent can use the fTPM signing key; other NICo
 //! pods (fmds, …) obtain bearer tokens from the agent's local API — the
 //! `AgentLocal` gRPC service on a unix socket in the shared `/opt/forge`
-//! directory — instead of mounting the key to do their own mTLS/minting.
+//! directory — instead of needing TPM access to mint their own token.
 //!
 //! [`SocketTokenSource`] keeps a cached token fresh with a background task and
 //! serves it synchronously from [`NodeTokenProvider::current`] on the request
@@ -86,7 +86,7 @@ impl Drop for SocketTokenSource {
 
 /// Manual impl so the cached bearer token (a live credential) never lands in
 /// debug output of the client config, which is itself `Debug`-logged. Mirrors
-/// the redaction on [`NodeJwtMinter`](crate::node_jwt::NodeJwtMinter).
+/// the redaction on [`TpmNodeJwtMinter`](crate::node_jwt::TpmNodeJwtMinter).
 impl std::fmt::Debug for SocketTokenSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SocketTokenSource")

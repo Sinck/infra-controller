@@ -367,6 +367,7 @@ impl InternalRBACRules {
             vec![ForgeAdminCLI, SiteAgent, Flow],
         );
         x.perm("AttestQuote", vec![Anonymous]);
+        x.perm("RegisterNodeAuthKey", vec![Anonymous]);
         x.perm("SignMachineIdentity", vec![Agent]);
         x.perm(
             "GetTenantIdentityConfiguration",

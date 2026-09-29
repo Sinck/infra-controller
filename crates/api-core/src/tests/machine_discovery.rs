@@ -33,6 +33,7 @@ use model::hardware_info::{HardwareInfo, TpmEkCertificate};
 use model::machine::machine_id::from_hardware_info;
 use model::machine::machine_search_config::MachineSearchConfig;
 use model::resource_pool::{ResourcePoolDef, ResourcePoolType};
+use model::test_support::DpuConfig;
 use rpc::forge::forge_server::Forge;
 use tonic::{Code, Request};
 
@@ -80,6 +81,36 @@ fn discovery_request_from(
             peer_certificates: vec![],
         }));
     request
+}
+
+#[test]
+fn node_auth_ek_certificate_does_not_change_machine_id() {
+    let hardware_infos = [
+        HardwareInfo::from(&DpuConfig::default()),
+        HardwareInfo::from(&model::test_support::ManagedHostConfig::default()),
+    ];
+
+    for hardware_info in hardware_infos {
+        let expected_machine_id = from_hardware_info(&hardware_info).unwrap();
+        let request = rpc::MachineDiscoveryInfo {
+            discovery_data: Some(rpc::DiscoveryData::Info(
+                rpc::DiscoveryInfo::try_from(hardware_info).unwrap(),
+            )),
+            // Node-auth transports its EK outside DiscoveryInfo. Including it
+            // must not affect either a DPU's DMI-derived identity or a host's
+            // TPM-derived identity.
+            node_auth_ek_certificate: vec![0x01, 0x02, 0x03],
+            ..Default::default()
+        };
+        let rpc::forge::machine_discovery_info::DiscoveryData::Info(discovery_info) =
+            request.discovery_data.unwrap();
+        let rediscovered_hardware = HardwareInfo::try_from(discovery_info).unwrap();
+
+        assert_eq!(
+            from_hardware_info(&rediscovered_hardware).unwrap(),
+            expected_machine_id
+        );
+    }
 }
 
 async fn allocated_host_for_secure_discovery(

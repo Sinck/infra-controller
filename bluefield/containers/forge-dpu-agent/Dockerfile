@@ -34,6 +34,9 @@ FROM --platform=linux/arm64 debian:bookworm-slim AS builder
 # Get libraries and install MFT (provides flint for DPU firmware enumeration)
 RUN apt-get update && apt-get install -y \
      libudev1 \
+     libtss2-esys-3.0.2-0 \
+     libtss2-tcti-device0 \
+     libtss2-tctildr0 \
      bash
 
 # Working flint extraction
@@ -48,6 +51,17 @@ RUN mkdir -p /deps && \
 # Setup directory to collect all shared libraries
 RUN mkdir -p /deps && \
     cp $(ldd /bin/bash | grep "=> /" | awk '{print $3}') /deps/
+
+# `forge-dpu-agent` links TPM2-TSS directly and the TCTI loader loads the
+# device TCTI dynamically for `device:/dev/tpmrm0`.
+RUN for library in \
+        /usr/lib/aarch64-linux-gnu/libtss2-esys.so.0 \
+        /usr/lib/aarch64-linux-gnu/libtss2-tctildr.so.0 \
+        /usr/lib/aarch64-linux-gnu/libtss2-mu.so.0 \
+        /usr/lib/aarch64-linux-gnu/libtss2-tcti-device.so.0; do \
+        cp "$library" /deps/; \
+        ldd "$library" | grep "=> /" | awk '{print $3}' | xargs -r -I '{}' cp -v '{}' /deps/; \
+    done
 
 # Stage 2
 FROM --platform=linux/arm64 ${IMG}:${TAG}-${DISTROLESS_DEBUG_TAG}

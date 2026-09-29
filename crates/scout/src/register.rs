@@ -16,6 +16,7 @@
  */
 
 use ::rpc::MachineDiscoveryReporter;
+use ::rpc::node_tpm::NodeAuthEnrollment;
 use carbide_host_support::hardware_enumeration::enumerate_hardware;
 use carbide_host_support::registration;
 use carbide_host_support::registration::RegistrationError;
@@ -39,6 +40,32 @@ pub(super) async fn run(
     // Missing TPM EK material must not be treated as DPU detection. DPUs are
     // identified from platform SMBIOS data, not from TPM availability.
     let is_dpu = !platform::is_host();
+
+    // Keep node-auth material separate from measured-boot's AK.  The latter
+    // is transient evidence for a PCR quote; this AK certifies the durable
+    // TPM-resident ES256 signing key that the API will register for JWTs.
+    let (mut node_auth_enrollment, node_auth_ek_certificate) = if tpm::tpm_present(tpm_path) {
+        match NodeAuthEnrollment::new(tpm_path) {
+            Ok(mut enrollment) => match enrollment.ek_certificate() {
+                Ok(ek_certificate) => (Some(enrollment), Some(ek_certificate)),
+                Err(error) => {
+                    tracing::warn!(%error, "Could not read TPM EK certificate for node-auth enrollment");
+                    (None, None)
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%error, "Could not prepare TPM node-auth signing key");
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
+    let node_auth_public_key = node_auth_enrollment
+        .as_mut()
+        .map(NodeAuthEnrollment::discovery_public_key)
+        .transpose()
+        .map_err(|error| CarbideClientError::TpmError(error.to_string()))?;
 
     if machine_interface_id.is_none() && !is_dpu {
         return Err(CarbideClientError::GenericError(
@@ -103,9 +130,14 @@ pub(super) async fn run(
             is_dpu,
             MachineDiscoveryReporter::Scout,
             Some(carbide_version::v!(build_version).to_string()),
+            node_auth_public_key,
+            node_auth_ek_certificate,
         )
         .await?;
-    let machine_id = registration_data.machine_id;
+    let registration::RegistrationData {
+        machine_id,
+        node_auth_key_challenge,
+    } = registration_data;
     info!(
         %machine_id,
         ?machine_interface_id,
@@ -198,6 +230,27 @@ pub(super) async fn run(
                 return Err(RegistrationError::AttestationFailed.into());
             }
         }
+    }
+
+    if let (Some(enrollment), Some(challenge)) =
+        (node_auth_enrollment.as_mut(), node_auth_key_challenge)
+    {
+        let certification = enrollment
+            .activate_and_certify(&challenge.cred_blob, &challenge.encrypted_secret)
+            .map_err(|error| CarbideClientError::TpmError(error.to_string()))?;
+        registration::register_node_auth_key(
+            forge_api,
+            root_ca,
+            false,
+            retry.clone(),
+            ::rpc::forge::RegisterNodeAuthKeyRequest {
+                machine_id: Some(machine_id),
+                credential: certification.credential,
+                attestation: certification.attestation,
+                signature: certification.signature,
+            },
+        )
+        .await?;
     }
 
     Ok((machine_id, interface_id))

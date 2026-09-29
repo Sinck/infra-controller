@@ -26,6 +26,7 @@ use carbide_uuid::machine::MachineId;
 use carbide_uuid::measured_boot::MeasurementReportId;
 use chrono::Utc;
 use db::db_read::DbReader;
+use model::hardware_info::TpmEkCertificate;
 use model::machine::MeasuringState;
 use pkcs1::LineEnding;
 use rsa::pkcs1::EncodeRsaPublicKey;
@@ -335,9 +336,17 @@ pub(crate) async fn compare_pub_key_against_cert(
     ek_pub: &[u8],
 ) -> CarbideResult<(bool, rsa::RsaPublicKey)> {
     let tpm_ek_cert = get_ek_cert_by_machine_id(txn, machine_id).await?;
+    compare_ek_pub_against_certificate(&tpm_ek_cert, ek_pub)
+}
+
+#[cfg_attr(not(feature = "linux-build"), allow(unused_variables))]
+pub(crate) fn compare_ek_pub_against_certificate(
+    tpm_ek_cert: &TpmEkCertificate,
+    ek_pub: &[u8],
+) -> CarbideResult<(bool, rsa::RsaPublicKey)> {
     #[cfg(feature = "linux-build")]
     {
-        linux_build::do_compare_pub_key_against_cert(&tpm_ek_cert, ek_pub)
+        linux_build::do_compare_pub_key_against_cert(tpm_ek_cert, ek_pub)
     }
     #[cfg(not(feature = "linux-build"))]
     {

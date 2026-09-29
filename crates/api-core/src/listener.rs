@@ -496,10 +496,6 @@ pub(crate) async fn start(
     // connection would turn a half-written identity file into one full rebuild
     // (file reads, PEM parsing, a blocking task) per inbound connection.
     let mut tls_refresh_after = TLS_REFRESH_INTERVAL;
-    // Refreshed alongside the TLS acceptor below; both read the same client-CA
-    // bundle, so they must not drift apart.
-    let node_jwt_validator = api_service.node_jwt_validator.clone();
-
     join_set
         .build_task()
         .name("listener accept loop")
@@ -534,41 +530,16 @@ pub(crate) async fn start(
                     initialize_tls_acceptor = false;
                     tls_acceptor_created = Instant::now();
 
-                    // Node-auth JWTs chain to the same client-CA bundle the TLS
-                    // listener verifies client certs against, so the acceptor
-                    // and the validator's trust anchors have to move as one.
-                    // Two ways that can go wrong, and both matter once
-                    // mtls_enabled = false leaves tokens as the only
-                    // credential: anchors left stale reject tokens issued under
-                    // the new CA, and an acceptor dropped to `None` puts the
-                    // listener on its plaintext branch while the bearer
-                    // authenticator keeps accepting JWTs in the clear.
-                    //
-                    // So do every fallible step first and swap nothing until
-                    // both succeed. Committing one without the other would
-                    // leave the TLS path trusting one generation of the bundle
-                    // and the token path another.
-                    // One read of the client-CA bundle feeds both builders.
-                    // Reading it separately in each would let a rotation land
-                    // between them, so the pair could be committed together and
-                    // still disagree about which generation they trust.
-                    let (rebuilt_acceptor, rebuilt_jwt_roots) = tokio::task::Builder::new()
+                    // TPM-backed node JWTs are verified against the enrolled
+                    // public-key registry, independent of the TLS client-CA
+                    // bundle. Rebuild only the TLS acceptor here.
+                    let rebuilt_acceptor = tokio::task::Builder::new()
                         .name("tls trust rebuild")
                         .spawn_blocking({
                             let tls_config = tls_config.clone();
-                            let node_jwt_validator = node_jwt_validator.clone();
                             move || {
-                                let Some(client_ca) = read_client_ca(&tls_config) else {
-                                    return (None, Ok(None));
-                                };
-                                let acceptor = get_tls_acceptor(&tls_config, &client_ca);
-                                let roots = match node_jwt_validator.as_ref() {
-                                    None => Ok(None),
-                                    Some(validator) => {
-                                        validator.build_roots_from_pem(&client_ca).map(Some)
-                                    }
-                                };
-                                (acceptor, roots)
+                                let client_ca = read_client_ca(&tls_config)?;
+                                get_tls_acceptor(&tls_config, &client_ca)
                             }
                         })
                         // Safety: spawn_blocking only returns Error if run outside the tokio runtime
@@ -578,18 +549,12 @@ pub(crate) async fn start(
                         // propagate panics
                         .expect("task panicked");
 
-                    match (rebuilt_acceptor, rebuilt_jwt_roots) {
-                        (Some(acceptor), Ok(roots)) => {
-                            // Commit phase: nothing below this line can fail.
-                            if let (Some(validator), Some(roots)) =
-                                (node_jwt_validator.as_ref(), roots)
-                            {
-                                validator.install_roots(roots);
-                            }
+                    match rebuilt_acceptor {
+                        Some(acceptor) => {
                             tls_acceptor = Some(acceptor);
                             tls_refresh_after = TLS_REFRESH_INTERVAL;
                         }
-                        (acceptor, roots) => {
+                        None => {
                             // Come back sooner than the rotation cadence, but
                             // on a timer rather than on the next connection:
                             // the previous pair is still serving, so there is
@@ -597,11 +562,7 @@ pub(crate) async fn start(
                             // connection on while the files stay broken.
                             tls_refresh_after = TLS_REFRESH_RETRY_DELAY;
                             tracing::error!(
-                                target: "node_auth",
-                                tls_acceptor_rebuilt = acceptor.is_some(),
-                                jwt_roots_rebuilt = roots.is_ok(),
-                                "node-auth: could not rebuild both the TLS acceptor and the \
-                                 token trust anchors; keeping the previous pair and retrying"
+                                "could not rebuild TLS acceptor; keeping the previous acceptor and retrying"
                             );
                         }
                     }

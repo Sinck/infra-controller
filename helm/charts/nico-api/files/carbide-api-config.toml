@@ -44,9 +44,9 @@ create_machines = true
 # Node (Scout / DPU-agent) authentication to the API.
 # See docs/design/machine-identity/node-auth-jwt.md.
 # Bearer JWTs: off by default. When enabled, the API accepts short-lived
-# `Authorization: Bearer` tokens that nodes self-sign with their existing
-# mTLS client-certificate key (the cert rides in the token's x5c header and
-# is verified against the same root CA as the TLS listener).
+# `Authorization: Bearer` tokens signed by a P-256 key held in the host TPM
+# or DPU fTPM. Discovery enrolls each public key only after an EK/AK
+# credential challenge and TPM2_Certify verification.
 enabled = false
 # Machine mTLS client-certificate authentication: on by default. Disable only
 # after the fleet presents bearer tokens (requires enabled = true; the API

@@ -41,7 +41,7 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 use crate::forge::VersionRequest;
 use crate::forge_resolver::resolver::ResolverError;
 use crate::forge_tls_client::ConfigurationError::CouldNotReadRootCa;
-use crate::node_jwt::{BearerAuthService, NodeJwtMinter, NodeTokenProvider};
+use crate::node_jwt::{BearerAuthService, NodeTokenProvider, TpmNodeJwtMinter};
 use crate::protos::forge::forge_client::ForgeClient;
 use crate::protos::nmx_c::nmx_controller_client::NmxControllerClient;
 use crate::{forge_resolver, protos};
@@ -98,10 +98,10 @@ pub struct ForgeClientConfig {
     pub connect_retries_max: Option<u32>,
     pub connect_retries_interval: Option<Duration>,
     /// Optional node-auth token provider (issue #355). When set, each request
-    /// carries an `Authorization: Bearer <jwt>` — either self-signed with the
-    /// client certificate's own private key ([`NodeJwtMinter`]) or fetched
-    /// from the dpu-agent's local API (`SocketTokenSource`). Independent of
-    /// mTLS: the channel may present a client cert, a token, or both.
+    /// carries an `Authorization: Bearer <jwt>` — signed by a host TPM or DPU
+    /// fTPM (`TpmNodeJwtMinter`) or fetched from the dpu-agent's local API
+    /// (`SocketTokenSource`). Independent of mTLS: the channel may present a
+    /// client cert, a token, or both.
     pub node_token_provider: Option<Arc<dyn NodeTokenProvider>>,
 }
 
@@ -165,20 +165,18 @@ impl ForgeClientConfig {
         self
     }
 
-    /// Enables node-auth JWTs: requests built from this config mint and carry
-    /// short-lived bearer tokens signed with the configured client cert's key.
-    /// A no-op when no client cert is configured.
+    /// Enables TPM-backed node-auth JWTs. Requests built from this config mint
+    /// and carry short-lived tokens signed by the host TPM or DPU fTPM.
     #[must_use]
-    pub fn with_node_jwt(mut self) -> Self {
-        self.node_token_provider = self.client_cert.as_ref().map(|client_cert| {
-            NodeJwtMinter::new(client_cert.cert_path.clone(), client_cert.key_path.clone())
-                as Arc<dyn NodeTokenProvider>
-        });
+    pub fn with_node_jwt(mut self, tpm_path: String) -> Self {
+        self.node_token_provider =
+            Some(TpmNodeJwtMinter::new(tpm_path) as Arc<dyn NodeTokenProvider>);
+        self.enforce_tls = std::env::var("DISABLE_TLS_ENFORCEMENT").is_err();
         self
     }
 
     /// Attaches an explicit node-auth token provider — e.g. a pre-built
-    /// [`NodeJwtMinter`] the caller also serves through the agent's local
+    /// [`TpmNodeJwtMinter`] the caller also serves through the agent's local
     /// API, or a `SocketTokenSource` in a process that holds no key at all.
     ///
     /// Implies [`require_tls_enforcement`](Self::require_tls_enforcement).

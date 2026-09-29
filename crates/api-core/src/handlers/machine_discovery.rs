@@ -25,7 +25,9 @@ use carbide_uuid::machine::MachineIdSource;
 use carbide_uuid::nvlink::NvLinkDomainId;
 use db::WithTransaction;
 use futures_util::FutureExt;
-use model::hardware_info::{GpuPlatformInfo, HardwareInfo, MachineNvLinkInfo, NvLinkGpu};
+use model::hardware_info::{
+    GpuPlatformInfo, HardwareInfo, MachineNvLinkInfo, NvLinkGpu, TpmEkCertificate,
+};
 use model::machine::machine_id::{from_hardware_info, host_id_from_dpu_hardware_info};
 use model::machine::machine_search_config::MachineSearchConfig;
 use model::machine::{DpuInitState, DpuInitStates, ManagedHostState};
@@ -54,6 +56,8 @@ pub(crate) async fn discover_machine(
 
     let machine_discovery_info = request.into_inner();
     let discovery_reporter = machine_discovery_info.discovery_reporter();
+    let node_auth_public_key = machine_discovery_info.node_auth_public_key.clone();
+    let node_auth_ek_certificate = machine_discovery_info.node_auth_ek_certificate.clone();
 
     let discovery_data = machine_discovery_info
         .discovery_data
@@ -65,6 +69,24 @@ pub(crate) async fn discover_machine(
         })?;
     let attest_key_info_opt = discovery_data.attest_key_info.clone();
     let hardware_info = HardwareInfo::try_from(discovery_data).map_err(CarbideError::from)?;
+
+    // Node-auth's RSA EK certificate stays outside DiscoveryInfo. On a host,
+    // DiscoveryInfo may carry a concatenated RSA and ECC certificate whose
+    // exact bytes determine its TPM-derived MachineId; replacing it would
+    // silently create a different machine identity.
+    let tpm_ek_certificate = if api.runtime_config.node_auth.enabled {
+        (!node_auth_ek_certificate.is_empty())
+            .then(|| TpmEkCertificate::from(node_auth_ek_certificate))
+    } else {
+        hardware_info.tpm_ek_certificate.clone()
+    };
+
+    if api.runtime_config.node_auth.enabled {
+        let node_auth_public_key = node_auth_public_key.as_ref().ok_or_else(|| {
+            CarbideError::InvalidArgument("NodeAuthPublicKey is not populated".to_string())
+        })?;
+        crate::handlers::node_auth::validate_discovery_key(node_auth_public_key)?;
+    }
 
     // this is an early check for certificate creation that happens later on in this method.
     // let's save us the hassle and return immediately if the below condition is not satisfied
@@ -264,26 +286,33 @@ pub(crate) async fn discover_machine(
         .into());
     }
 
-    if !hardware_info.is_dpu()
-        && hardware_info.tpm_ek_certificate.is_none()
-        && api.runtime_config.tpm_required
+    let tpm_required_for_node_auth = api.runtime_config.node_auth.enabled;
+    let tpm_identity_required = !hardware_info.is_dpu() || tpm_required_for_node_auth;
+    if tpm_identity_required
+        && tpm_ek_certificate.is_none()
+        && (api.runtime_config.tpm_required || tpm_required_for_node_auth)
     {
-        return Err(CarbideError::InvalidArgument(format!(
-            "ignoring DiscoverMachine request for non-tpm enabled host with InterfaceId {:?}",
-            caller_interface.id,
-        ))
-        .into());
-    } else if !hardware_info.is_dpu() && hardware_info.tpm_ek_certificate.is_some() {
-        // this means we do have an EK cert for a host
-
-        // get the EK cert from incoming message
-        let tpm_ek_cert =
-            hardware_info
-                .tpm_ek_certificate
-                .as_ref()
-                .ok_or(CarbideError::InvalidArgument(
-                    "tpm_ek_cert is empty".to_string(),
-                ))?;
+        let message = if hardware_info.is_dpu() {
+            format!(
+                "ignoring DiscoverMachine request for DPU without a TPM EK certificate with InterfaceId {:?}",
+                caller_interface.id,
+            )
+        } else {
+            format!(
+                "ignoring DiscoverMachine request for non-tpm enabled host with InterfaceId {:?}",
+                caller_interface.id,
+            )
+        };
+        return Err(CarbideError::InvalidArgument(message).into());
+    } else if tpm_identity_required && tpm_ek_certificate.is_some() {
+        // Record every EK that participates in node-auth, including a DPU
+        // fTPM. The later credential challenge rejects certificates whose
+        // issuer is not one of the configured TPM CAs.
+        let tpm_ek_cert = tpm_ek_certificate
+            .as_ref()
+            .ok_or(CarbideError::InvalidArgument(
+                "tpm_ek_cert is empty".to_string(),
+            ))?;
 
         attest::match_insert_new_ek_cert_status_against_ca(
             &mut txn,
@@ -545,6 +574,30 @@ pub(crate) async fn discover_machine(
         None
     };
 
+    let node_auth_key_challenge = if api.runtime_config.node_auth.enabled {
+        let node_auth_public_key = node_auth_public_key.as_ref().ok_or_else(|| {
+            CarbideError::InvalidArgument(
+                "internal error: NodeAuthPublicKey was not validated".to_string(),
+            )
+        })?;
+        let tpm_ek_cert = tpm_ek_certificate.as_ref().ok_or_else(|| {
+            CarbideError::InvalidArgument(
+                "internal error: node-auth TPM EK certificate was not validated".to_string(),
+            )
+        })?;
+        Some(
+            crate::handlers::node_auth::create_key_challenge(
+                &mut txn,
+                node_auth_public_key,
+                &machine_id,
+                tpm_ek_cert,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
     if let Some(nvlink_info) = nvlink_info {
         db::machine::update_nvlink_info(&mut txn, &machine_id, nvlink_info).await?;
     }
@@ -587,6 +640,7 @@ pub(crate) async fn discover_machine(
         machine_certificate,
         attest_key_challenge,
         machine_interface_id: Some(caller_interface.id),
+        node_auth_key_challenge,
     }));
 
     if hardware_info.is_dpu()

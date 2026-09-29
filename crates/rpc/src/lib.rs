@@ -83,6 +83,7 @@ pub mod measured_boot;
 pub mod network;
 pub mod node_jwt;
 pub mod node_token_socket;
+pub mod node_tpm;
 pub mod protos;
 pub mod secrets;
 mod site_explorer_report;

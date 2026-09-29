@@ -618,7 +618,7 @@ pub(crate) fn dhcp_server_service(
 /// `use_node_tokens` defaults to the API's `[node_auth] enabled` switch and can
 /// be overridden by `fmds_use_node_tokens`: when set, fmds is deployed fetching
 /// bearer JWTs from the dpu-agent's local API socket instead of mounting the
-/// machine cert/key (issue #355). Requires a dpu-agent image that serves the
+/// DPU fTPM signing key (issue #355). Requires a dpu-agent image that serves the
 /// local API.
 pub(crate) fn fmds_service(
     cfg: &DpfServiceConfig,

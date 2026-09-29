@@ -2994,6 +2994,7 @@ dependencies = [
  "trace-propagation",
  "tracing",
  "tryhard",
+ "tss-esapi",
  "uuid",
  "x509-parser",
 ]

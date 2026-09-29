@@ -547,9 +547,9 @@ pub struct CarbideConfig {
     #[serde(default)]
     pub machine_identity: MachineIdentityConfig,
 
-    /// Node-auth: bearer JWTs that Scout / DPU-agent self-sign with their
-    /// existing mTLS client-certificate key, accepted alongside (or instead
-    /// of) mTLS. Section `[node_auth]`.
+    /// Node-auth: bearer JWTs that Scout / DPU-agent sign with a TPM-held
+    /// ES256 key, accepted alongside (or instead of) mTLS. Section
+    /// `[node_auth]`.
     #[serde(default)]
     pub node_auth: NodeAuthConfig,
 
@@ -2224,10 +2224,9 @@ impl Default for MachineIdentityConfig {
 /// Node-auth (Scout / DPU-agent bearer JWT) configuration.
 /// Loaded from `[node_auth]` section in config.
 ///
-/// There is no server-side signing key: nodes self-sign tokens with their
-/// existing mTLS client-certificate key and the API validates the embedded
-/// `x5c` chain against the client-cert root CA (see
-/// `docs/design/machine-identity/node-auth-jwt.md`).
+/// Nodes sign tokens with a P-256 key that never leaves their host TPM or DPU
+/// fTPM. Discovery enrolls that public key only after an EK/AK credential
+/// challenge and `TPM2_Certify`; the API verifies JWTs against this registry.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeAuthConfig {

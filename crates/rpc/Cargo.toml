@@ -97,6 +97,7 @@ tryhard = { workspace = true }
 rustls = { workspace = true }
 async-trait = { workspace = true }
 nonempty = { workspace = true }
+tss-esapi = { workspace = true }
 clap = { features = ["derive"], optional = true, workspace = true }
 sqlx = { workspace = true, features = [
   "runtime-tokio",

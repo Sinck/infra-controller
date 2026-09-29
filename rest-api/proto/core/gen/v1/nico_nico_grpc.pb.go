@@ -116,6 +116,7 @@ const (
 	Forge_InvokeInstancePower_FullMethodName                                = "/forge.Forge/InvokeInstancePower"
 	Forge_ForgeAgentControl_FullMethodName                                  = "/forge.Forge/ForgeAgentControl"
 	Forge_DiscoverMachine_FullMethodName                                    = "/forge.Forge/DiscoverMachine"
+	Forge_RegisterNodeAuthKey_FullMethodName                                = "/forge.Forge/RegisterNodeAuthKey"
 	Forge_RenewMachineCertificate_FullMethodName                            = "/forge.Forge/RenewMachineCertificate"
 	Forge_DiscoveryCompleted_FullMethodName                                 = "/forge.Forge/DiscoveryCompleted"
 	Forge_CleanupMachineCompleted_FullMethodName                            = "/forge.Forge/CleanupMachineCompleted"
@@ -673,6 +674,8 @@ type ForgeClient interface {
 	ForgeAgentControl(ctx context.Context, in *ForgeAgentControlRequest, opts ...grpc.CallOption) (*ForgeAgentControlResponse, error)
 	// PRIVILEGED: Creates a new machine from nothing
 	DiscoverMachine(ctx context.Context, in *MachineDiscoveryInfo, opts ...grpc.CallOption) (*MachineDiscoveryResult, error)
+	// Completes the TPM-backed node-auth key enrollment started by discovery.
+	RegisterNodeAuthKey(ctx context.Context, in *RegisterNodeAuthKeyRequest, opts ...grpc.CallOption) (*RegisterNodeAuthKeyResponse, error)
 	RenewMachineCertificate(ctx context.Context, in *MachineCertificateRenewRequest, opts ...grpc.CallOption) (*MachineCertificateResult, error)
 	DiscoveryCompleted(ctx context.Context, in *MachineDiscoveryCompletedRequest, opts ...grpc.CallOption) (*MachineDiscoveryCompletedResponse, error)
 	CleanupMachineCompleted(ctx context.Context, in *MachineCleanupInfo, opts ...grpc.CallOption) (*MachineCleanupResult, error)
@@ -2308,6 +2311,16 @@ func (c *forgeClient) DiscoverMachine(ctx context.Context, in *MachineDiscoveryI
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(MachineDiscoveryResult)
 	err := c.cc.Invoke(ctx, Forge_DiscoverMachine_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *forgeClient) RegisterNodeAuthKey(ctx context.Context, in *RegisterNodeAuthKeyRequest, opts ...grpc.CallOption) (*RegisterNodeAuthKeyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RegisterNodeAuthKeyResponse)
+	err := c.cc.Invoke(ctx, Forge_RegisterNodeAuthKey_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -6355,6 +6368,8 @@ type ForgeServer interface {
 	ForgeAgentControl(context.Context, *ForgeAgentControlRequest) (*ForgeAgentControlResponse, error)
 	// PRIVILEGED: Creates a new machine from nothing
 	DiscoverMachine(context.Context, *MachineDiscoveryInfo) (*MachineDiscoveryResult, error)
+	// Completes the TPM-backed node-auth key enrollment started by discovery.
+	RegisterNodeAuthKey(context.Context, *RegisterNodeAuthKeyRequest) (*RegisterNodeAuthKeyResponse, error)
 	RenewMachineCertificate(context.Context, *MachineCertificateRenewRequest) (*MachineCertificateResult, error)
 	DiscoveryCompleted(context.Context, *MachineDiscoveryCompletedRequest) (*MachineDiscoveryCompletedResponse, error)
 	CleanupMachineCompleted(context.Context, *MachineCleanupInfo) (*MachineCleanupResult, error)
@@ -7336,6 +7351,9 @@ func (UnimplementedForgeServer) ForgeAgentControl(context.Context, *ForgeAgentCo
 }
 func (UnimplementedForgeServer) DiscoverMachine(context.Context, *MachineDiscoveryInfo) (*MachineDiscoveryResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method DiscoverMachine not implemented")
+}
+func (UnimplementedForgeServer) RegisterNodeAuthKey(context.Context, *RegisterNodeAuthKeyRequest) (*RegisterNodeAuthKeyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RegisterNodeAuthKey not implemented")
 }
 func (UnimplementedForgeServer) RenewMachineCertificate(context.Context, *MachineCertificateRenewRequest) (*MachineCertificateResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method RenewMachineCertificate not implemented")
@@ -10188,6 +10206,24 @@ func _Forge_DiscoverMachine_Handler(srv interface{}, ctx context.Context, dec fu
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ForgeServer).DiscoverMachine(ctx, req.(*MachineDiscoveryInfo))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Forge_RegisterNodeAuthKey_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RegisterNodeAuthKeyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).RegisterNodeAuthKey(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_RegisterNodeAuthKey_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).RegisterNodeAuthKey(ctx, req.(*RegisterNodeAuthKeyRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -17525,6 +17561,10 @@ var Forge_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DiscoverMachine",
 			Handler:    _Forge_DiscoverMachine_Handler,
+		},
+		{
+			MethodName: "RegisterNodeAuthKey",
+			Handler:    _Forge_RegisterNodeAuthKey_Handler,
 		},
 		{
 			MethodName: "RenewMachineCertificate",

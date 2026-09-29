@@ -1,6 +1,7 @@
 suite: machine identity configuration
 templates:
   - daemonset.yaml
+  - configmap.yaml
 tests:
   - it: uses the Forge signer by default
     set:
@@ -13,6 +14,9 @@ tests:
           content: --config-path=/etc/forge/config.toml
 
   - it: mounts the configured agent file
+    documentSelector:
+      path: kind
+      value: DaemonSet
     set:
       image:
         repository: test

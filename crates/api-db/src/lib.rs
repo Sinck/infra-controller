@@ -71,6 +71,7 @@ pub mod network_devices;
 pub mod network_prefix;
 pub mod network_security_group;
 pub mod network_segment;
+pub mod node_auth_key;
 pub mod nvl_logical_partition;
 pub mod nvl_partition;
 pub mod nvlink_domain_health_report;

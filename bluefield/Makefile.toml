@@ -19,6 +19,11 @@
 REPO_ROOT = { script = [
   "dirname $(cargo locate-project --message-format plain --workspace)",
 ] }
+# Local development may use an unreleased libredfish checkout.  Its path in
+# Cargo.toml is absolute, so the cross-build container must mount it there too.
+LIBREDFISH_DIRECTORY = { value = "/data/code/libredfish", condition = { env_not_set = [
+  "LIBREDFISH_DIRECTORY",
+] } }
 # e.g. 2024.05.24-rc1-0-0-g786e94757
 DPU_AGENT_PKG_VERSION = { script = [
   "if [ -n \"$VERSION\" ]; then echo \"$VERSION\" | sed 's/^v//'; else v=$(git describe --tags --first-parent --always --long | sed 's/^v//'); case \"$v\" in [0-9]*) echo \"$v\" ;; *) echo \"0.0.0-$v\" ;; esac; fi",
@@ -83,7 +88,7 @@ workspace = false
 script = '''
 set -e
 
-docker run --rm -v $REPO_ROOT:/carbide --user $(id -u):$(id -g) \
+docker run --rm -v $REPO_ROOT:/carbide -v $LIBREDFISH_DIRECTORY:/data/code/libredfish:ro --user $(id -u):$(id -g) \
     --env CARGO_HOME=/cargo \
     -v $CARGO_HOME:/cargo \
     build-artifacts-container-cross-aarch64:latest \

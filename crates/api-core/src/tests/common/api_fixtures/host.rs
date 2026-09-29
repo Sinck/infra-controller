@@ -144,6 +144,8 @@ pub(in crate::tests) async fn host_discover_machine_with_reporter(
             create_machine: true,
             discovery_reporter: reporter as i32,
             discovery_reporter_version: reporter_version.map(str::to_owned),
+            node_auth_public_key: None,
+            node_auth_ek_certificate: vec![],
         }))
         .await
         .unwrap()

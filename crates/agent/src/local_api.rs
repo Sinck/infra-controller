@@ -31,13 +31,13 @@ use std::sync::Arc;
 
 use ::rpc::agent_local::agent_local_server::{AgentLocal, AgentLocalServer};
 use ::rpc::agent_local::{GetNodeTokenRequest, GetNodeTokenResponse};
-use ::rpc::node_jwt::NodeJwtMinter;
+use ::rpc::node_jwt::NodeTokenMinter;
 use eyre::WrapErr;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::{Request, Response, Status};
 
 struct AgentLocalService {
-    minter: Arc<NodeJwtMinter>,
+    minter: Arc<dyn NodeTokenMinter>,
 }
 
 #[tonic::async_trait]
@@ -46,15 +46,14 @@ impl AgentLocal for AgentLocalService {
         &self,
         _request: Request<GetNodeTokenRequest>,
     ) -> Result<Response<GetNodeTokenResponse>, Status> {
-        // Minting reads the cert/key from disk on cache miss — cheap enough to
-        // do inline, and it means the endpoint starts working the moment the
-        // machine certificate lands without any coordination.
+        // TPM signing happens only on a cache miss and keeps the private half
+        // in the TPM, so it is safe to broker the finished token here.
         match self.minter.current_with_expiry() {
             Some((token, expires_at)) => {
                 Ok(Response::new(GetNodeTokenResponse { token, expires_at }))
             }
             None => Err(Status::unavailable(
-                "no node token available yet; machine certificate not present or unreadable",
+                "no TPM-backed node token available yet",
             )),
         }
     }
@@ -214,7 +213,7 @@ fn remove_stale_socket(socket_path: &str) -> eyre::Result<()> {
 /// Deployment-agnostic: containerized (DPF) the socket lands on the mounted
 /// `/opt/forge` volume; as a plain service on DPU OS (non-DPF) the parent
 /// directory is created if the agent starts before anything else touched it.
-pub(crate) async fn serve(minter: Arc<NodeJwtMinter>, socket_path: &str) -> eyre::Result<()> {
+pub(crate) async fn serve(minter: Arc<dyn NodeTokenMinter>, socket_path: &str) -> eyre::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     if let Some(parent) = std::path::Path::new(socket_path).parent() {
@@ -237,43 +236,42 @@ pub(crate) async fn serve(minter: Arc<NodeJwtMinter>, socket_path: &str) -> eyre
 
 #[cfg(test)]
 mod tests {
-    use ::rpc::node_jwt::NodeTokenProvider;
+    use ::rpc::node_jwt::{NodeTokenMinter, NodeTokenProvider};
     use ::rpc::node_token_socket::SocketTokenSource;
 
     use super::*;
 
-    const SPIFFE_URI: &str = "spiffe://forge.local/forge-system/machine/fm100xtest";
+    #[derive(Debug)]
+    struct StaticTokenMinter;
 
-    fn write_cert_and_key(dir: &tempfile::TempDir) -> (String, String) {
-        let mut params = rcgen::CertificateParams::default();
-        params.subject_alt_names = vec![rcgen::SanType::URI(
-            rcgen::string::Ia5String::try_from(SPIFFE_URI.to_string()).expect("uri"),
-        )];
-        let key = rcgen::KeyPair::generate().expect("key pair");
-        let cert = params.self_signed(&key).expect("certificate");
-        let cert_path = dir.path().join("cert.pem");
-        let key_path = dir.path().join("cert.key");
-        std::fs::write(&cert_path, cert.pem()).expect("write cert");
-        std::fs::write(&key_path, key.serialize_pem()).expect("write key");
-        (
-            cert_path.to_string_lossy().into_owned(),
-            key_path.to_string_lossy().into_owned(),
-        )
+    impl NodeTokenProvider for StaticTokenMinter {
+        fn current(&self) -> Option<String> {
+            Some("test-node-token".to_string())
+        }
     }
 
-    /// End-to-end broker flow: agent serves tokens minted from the machine
-    /// cert; a key-less consumer obtains one through `SocketTokenSource`.
+    impl NodeTokenMinter for StaticTokenMinter {
+        fn current_with_expiry(&self) -> Option<(String, u64)> {
+            Some(("test-node-token".to_string(), u64::MAX))
+        }
+    }
+
+    fn minter() -> Arc<dyn NodeTokenMinter> {
+        Arc::new(StaticTokenMinter)
+    }
+
+    /// End-to-end broker flow: agent serves a TPM-minted token and a key-less
+    /// consumer obtains it through `SocketTokenSource`.
     #[tokio::test]
     async fn keyless_consumer_gets_token_via_socket() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (cert_path, key_path) = write_cert_and_key(&dir);
         // Its own subdirectory, as in production (`<certsDir>/run/agent.sock`):
         // the socket never shares a directory with the credentials.
         let socket = dir.path().join("run").join("agent.sock");
         let socket_str = socket.to_string_lossy().into_owned();
 
-        let minter = NodeJwtMinter::new(cert_path, key_path);
-        let expected = minter.current().expect("agent side can mint");
+        let minter = minter();
+        let expected = minter.current().expect("agent side has a token");
         tokio::spawn({
             let socket_str = socket_str.clone();
             async move { serve(minter, &socket_str).await }
@@ -295,13 +293,12 @@ mod tests {
     async fn socket_is_root_only() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tempdir");
-        let (cert_path, key_path) = write_cert_and_key(&dir);
         let socket = dir.path().join("run").join("agent.sock");
         let socket_str = socket.to_string_lossy().into_owned();
 
         tokio::spawn({
             let socket_str = socket_str.clone();
-            async move { serve(NodeJwtMinter::new(cert_path, key_path), &socket_str).await }
+            async move { serve(minter(), &socket_str).await }
         });
         // Wait for the mode, not merely for the socket to appear: `bind`
         // creates it at umask permissions and the chmod lands afterward, so
@@ -334,7 +331,6 @@ mod tests {
     async fn socket_directory_is_root_only_before_the_socket_exists() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tempdir");
-        let (cert_path, key_path) = write_cert_and_key(&dir);
         // A pre-existing, world-traversable directory: the agent must tighten
         // it rather than assume a fresh one.
         let run_dir = dir.path().join("run");
@@ -346,7 +342,7 @@ mod tests {
 
         tokio::spawn({
             let socket_str = socket_str.clone();
-            async move { serve(NodeJwtMinter::new(cert_path, key_path), &socket_str).await }
+            async move { serve(minter(), &socket_str).await }
         });
         for _ in 0..100 {
             if socket.exists() {

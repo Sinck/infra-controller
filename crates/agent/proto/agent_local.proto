@@ -28,14 +28,14 @@ package agent_local;
 // silently corrupt an inlined filesystem path into one that does not exist.
 // This is the consolidation point for
 // agent <-> co-located-service communication: services that today mount the
-// machine cert/key (or synced files) to talk to nico-api can instead ask the
+// machine certificate material to talk to nico-api can instead ask the
 // agent, and future local needs should add RPCs here rather than new
 // sockets, ports, or file drops.
 service AgentLocal {
-  // Returns the current node-auth bearer JWT, minted by the agent from the
-  // machine's client-certificate key (issue #355). Callers present it as
+  // Returns the current node-auth bearer JWT, signed by the agent through the
+  // DPU fTPM (issue #355). Callers present it as
   // `Authorization: Bearer <token>` to nico-api. Only the agent ever touches
-  // the private key. The empty request carries neither a caller identity nor
+  // the TPM signing key. The empty request carries neither a caller identity nor
   // a current token; access is controlled by the local socket's mount and
   // permissions.
   //

@@ -66,6 +66,7 @@ pub(super) mod network_devices;
 pub(super) mod network_security_group;
 pub(super) mod network_segment;
 pub(super) mod nmxc_browse;
+pub(super) mod node_auth;
 pub(super) mod nvl_partition;
 pub(super) mod nvlink_domain;
 pub(super) mod nvlink_nmxc_endpoints;

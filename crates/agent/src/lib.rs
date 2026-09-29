@@ -411,14 +411,10 @@ pub async fn start(cmdline: command_line::Options) -> eyre::Result<()> {
     // certificate renewal.
     republish_bootstrap_ca_if_changed(&agent.forge_system.root_ca);
 
-    // Node-auth (#355): the agent is the only process on the DPU that holds
-    // the machine key. This minter signs bearer JWTs for the agent's own API
-    // calls AND backs the local API socket that brokers tokens to co-located
-    // services (fmds, ...). Ignored by the API unless [node_auth] is enabled.
-    let node_jwt_minter = ::rpc::node_jwt::NodeJwtMinter::new(
-        agent.forge_system.client_cert.clone(),
-        agent.forge_system.client_key.clone(),
-    );
+    // The agent is the only process on the DPU that touches the fTPM signing
+    // key. It mints tokens for its own API calls and brokers finished tokens
+    // to co-located services through the local socket.
+    let node_jwt_minter = ::rpc::node_jwt::TpmNodeJwtMinter::with_default_tpm();
     let forge_client_config = Arc::new(
         ForgeClientConfig::new(
             agent.forge_system.root_ca.clone(),
@@ -892,6 +888,30 @@ async fn register(
         }?
     };
 
+    let (mut node_auth_enrollment, node_auth_ek_certificate) = if agent.machine.is_fake_dpu {
+        (None, None)
+    } else {
+        match ::rpc::node_tpm::NodeAuthEnrollment::new(::rpc::node_tpm::DEFAULT_NODE_AUTH_TPM_PATH)
+        {
+            Ok(mut enrollment) => match enrollment.ek_certificate() {
+                Ok(ek_certificate) => (Some(enrollment), Some(ek_certificate)),
+                Err(error) => {
+                    tracing::warn!(%error, "Could not read DPU fTPM EK certificate for node-auth enrollment");
+                    (None, None)
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%error, "Could not prepare DPU fTPM node-auth signing key");
+                (None, None)
+            }
+        }
+    };
+    let node_auth_public_key = node_auth_enrollment
+        .as_mut()
+        .map(::rpc::node_tpm::NodeAuthEnrollment::discovery_public_key)
+        .transpose()
+        .wrap_err("could not prepare DPU fTPM node-auth public key")?;
+
     let factory_mac_address: MacAddress = match hardware_info.dpu_info.as_ref() {
         Some(dpu_info) => dpu_info.factory_mac_address.parse().map_err(|e| {
             eyre::eyre!(
@@ -917,10 +937,40 @@ async fn register(
         !agent.machine.is_fake_dpu,
         ::rpc::MachineDiscoveryReporter::DpuAgent,
         Some(carbide_version::v!(build_version).to_string()),
+        node_auth_public_key,
+        node_auth_ek_certificate,
     )
     .await?;
 
-    let machine_id = registration_data.machine_id;
+    let carbide_host_support::registration::RegistrationData {
+        machine_id,
+        node_auth_key_challenge,
+    } = registration_data;
+
+    if let (Some(enrollment), Some(challenge)) =
+        (node_auth_enrollment.as_mut(), node_auth_key_challenge)
+    {
+        let certification = enrollment
+            .activate_and_certify(&challenge.cred_blob, &challenge.encrypted_secret)
+            .wrap_err("could not certify DPU fTPM node-auth key")?;
+        carbide_host_support::registration::register_node_auth_key(
+            &agent.forge_system.api_server,
+            agent.forge_system.root_ca.clone(),
+            false,
+            carbide_host_support::registration::DiscoveryRetry {
+                secs: agent.period.discovery_retry_secs,
+                max: agent.period.discovery_retries_max,
+            },
+            ::rpc::forge::RegisterNodeAuthKeyRequest {
+                machine_id: Some(machine_id),
+                credential: certification.credential,
+                attestation: certification.attestation,
+                signature: certification.signature,
+            },
+        )
+        .await?;
+    }
+
     tracing::info!(%machine_id, %factory_mac_address, "Successfully discovered machine");
 
     Ok(Registration {

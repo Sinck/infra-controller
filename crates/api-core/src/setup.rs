@@ -426,32 +426,70 @@ pub(crate) async fn start_runtime(
     // Node-auth (Scout / DPU-agent bearer JWT, #355) preflight. Run before any
     // DPF resource creation below, so a misconfiguration (the
     // enabled=false + mtls_enabled=false lockout, bearer-over-plaintext, or an
-    // unreadable trust anchor) fails startup before it mutates cluster state.
+    // unavailable TPM-key registry) fails startup before it mutates cluster state.
     // Validate unconditionally; when explicitly enabled, missing prerequisites
     // fail rather than silently degrading.
     carbide_config.node_auth.validate()?;
     let node_jwt_validator = if carbide_config.node_auth.enabled {
-        // Bearer tokens must never be accepted over plaintext, and the
-        // validator trusts the same roots the TLS listener uses for client
-        // certificates — so a TLS listener is required on both counts.
+        // Bearer tokens must never be accepted over plaintext. Their signing
+        // keys are TPM-certified during discovery, not derived from the TLS
+        // client-CA bundle, but the resulting principal still uses the
+        // configured machine SPIFFE path.
         if !matches!(carbide_config.listen_mode, ListenMode::Tls) {
             return Err(eyre::eyre!(
                 "[node_auth] is enabled but listen_mode is not \"tls\"; bearer tokens must not be accepted over plaintext"
             ));
         }
-        let tls_ref = carbide_config
+        carbide_config
             .tls
             .as_ref()
             .ok_or_else(|| eyre::eyre!("[node_auth] is enabled but [tls] is unset"))?;
+        let trust = carbide_config
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.trust.as_ref())
+            .ok_or_else(|| eyre::eyre!("[node_auth] is enabled but [auth].trust is unset"))?;
+        let machine_spiffe_prefix = format!(
+            "{}/",
+            format!(
+                "spiffe://{}{}",
+                trust.spiffe_trust_domain, trust.spiffe_machine_base_path
+            )
+            .trim_end_matches('/')
+        );
         Some(Arc::new(
-            crate::node_auth::NodeJwtValidator::from_root_ca_file(
-                &tls_ref.root_cafile_path,
+            crate::node_auth::NodeJwtValidator::from_database(
+                &db_pool,
                 &carbide_config.node_auth,
-            )?,
+                machine_spiffe_prefix,
+            )
+            .await?,
         ))
     } else {
         None
     };
+
+    if let Some(validator) = node_jwt_validator.as_ref() {
+        let validator = validator.clone();
+        let database = db_pool.clone();
+        let cancel_token = cancel_token.clone();
+        join_set
+            .build_task()
+            .name("node_auth_key_cache_refresh")
+            .spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                        _ = cancel_token.cancelled() => break,
+                    }
+                    if let Err(error) = validator.refresh(&database).await {
+                        tracing::error!(%error, "node-auth: could not refresh TPM JWT key cache");
+                    }
+                }
+            })
+            // Safety: spawn only fails if outside the Tokio runtime.
+            .expect("Could not spawn node_auth_key_cache_refresh task");
+    }
 
     let dpf_sdk = initialize_dpf_sdk(
         &carbide_config,
