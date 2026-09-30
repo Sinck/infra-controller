@@ -21,10 +21,8 @@ covers the three related epics:
 - [Phase 2: API authentication](https://github.com/dsx-ai-factory/infra-controller/issues/5199)
 - [Phase 3: remaining key and certificate services](https://github.com/dsx-ai-factory/infra-controller/issues/5200)
 
-The design is intentionally high level except for version-0 credential ownership
-and DPF BMC credential delivery, whose cross-component state and recovery
-contracts are defined here. Outside those areas, the following subsystem designs
-remain authoritative for their implementation:
+The design is intentionally high level. The following subsystem designs
+and operator contracts remain authoritative for their implementation:
 
 - [PostgreSQL-backed secret storage](postgres-secrets/README.md)
 - [Secrets-storage operator contract](../configuration/secrets-storage.md)
@@ -108,7 +106,7 @@ an end-state provider can still be Vault-backed where stated.
 | Optional DPU OTLP mTLS between the DPU collector and site gateway | Gateway `Certificate` already uses direct `site-issuer`; the gateway validates the DPU machine certificate with the leaf Secret's `ca.crt`, and the DPU pins the same `site-root` for the gateway | No migration is required: the gateway remains on the direct `site-issuer`, and the DPU client continues to use its dynamic node certificate under the same `site-root` | 3 |
 | Optional `nico-api` NVSwitch mTLS certificates: NICo client and NMX-C/NVUE server | `nvSwitchTls.issuerRef` defaults to `vault-nico-issuer` | Existing Vault-backed issuance remains supported. If direct cert-manager issuance is selected, it uses the same `site-root`; existing resources, Secrets, mounts, trust, leaves, and private keys remain unchanged | 3 |
 | Admin CLI client certificates | Vault PKI role `nico-cli-client`, issued by an operator | An independently managed admin CA can be added to API trust and issue a client certificate and key; the CLI continues to use its existing mTLS mechanism and inputs, and sites may retain the Vault-issued credential until they choose that migration | 2 |
-| DPF BMC credential bootstrap | The current installer no longer uses Vault: [#6487](https://github.com/dsx-ai-factory/infra-controller/pull/6487) replaced the root-token, temporary-certificate, and in-cluster CLI flow with a watched version-0 credential Secret and one Core rollout | The shipped shared `bmc-shared-password` projection supports initial bootstrap and gates new DPU registration until the credential is available; [#6147](https://github.com/dsx-ai-factory/infra-controller/issues/6147) adds per-DPU Secrets and the ingestion fence required for mixed-version rotation; version 1 and later remain in the persistent backend | 3 |
+| DPF BMC credential bootstrap | The current installer no longer uses Vault: [#6487](https://github.com/dsx-ai-factory/infra-controller/pull/6487) replaced the root-token, temporary-certificate, and in-cluster CLI flow with a watched version-0 credential Secret and one Core rollout | Initial bootstrap retains the version-0 source contract; [#6147](https://github.com/dsx-ai-factory/infra-controller/issues/6147) integrates per-DPU Secret delivery with the existing per-BMC credentials and rotation mechanism once supporting DPF behavior is qualified; version 1 and later remain in the persistent backend | 3 |
 | `dsx-exchange-consumer` credentials | Default credential chain, which always constructs a Vault client | Configurable local source or Vault reader, with a Vault client constructed only when selected, tracked by [#5957](https://github.com/dsx-ai-factory/infra-controller/issues/5957) | 3 |
 | `bmc-proxy` chart configuration | Vault AppRole, token, and cluster information are injected even though BMC credentials are fetched from `nico-api` over gRPC | Remove the Vault environment and configuration references under [#5957](https://github.com/dsx-ai-factory/infra-controller/issues/5957) | 3 |
 | `machine-a-tron` chart values | Stale Vault `envFrom` values remain but are not consumed by the deployment template | Remove the dead values under [#5957](https://github.com/dsx-ai-factory/infra-controller/issues/5957); its live TLS dependency is covered by the service-certificate row | 3 |
@@ -175,9 +173,9 @@ Remaining credential consumers outside `nico-api` migrate in Phase 3.
 
 The site-wide BMC root has one cross-phase exception: a local source may
 establish credential version 0 for initial DPF ingestion, but later versions
-come from the persistent backend through coordinated rotation. The DPF Secret
-projection, ingestion fence, and transition to per-device credentials are
-defined in [DPF BMC credential delivery](#dpf-bmc-credential-delivery) and
+come from the persistent backend through coordinated rotation. Per-DPU Secret
+delivery reuses the existing per-BMC credentials and rotation mechanism, as
+described in [DPF BMC credential delivery](#dpf-bmc-credential-delivery) and
 tracked by [#5958](https://github.com/dsx-ai-factory/infra-controller/issues/5958)
 and [#6147](https://github.com/dsx-ai-factory/infra-controller/issues/6147).
 
@@ -377,491 +375,30 @@ while using per-record DEKs wrapped by the configured production KEK provider.
 
 #### DPF BMC credential delivery
 
-`bmc_retain_credentials=true` selects a target-independent ingestion branch.
-Under the device reservation, NICo persists a retain intent, validates the
-operator-supplied current credential against the BMC, and stores it as the
-immutable encrypted per-device record without changing hardware or requiring a
-site target. The verified record remains staged under the retain intent while
-NICo creates downstream resources. For a DPU, NICo first derives the per-DPU
-Secret, creates `DPUDevice` with that reference, and only after successful
-registration transitions the intent to managed ownership. Registration failure
-leaves the non-retired intent and record for restart recovery; the normal
-no-side-effect cancellation proof may retire them only when no `DPUDevice` was
-created. Missing or invalid input fails before resource creation. Target
-advancement does not rebase retained intent or ownership. A later explicit
-rotation uses that record as the prior login credential and converges the device
-to the exact authority of the then-current site target.
+NICo already maintains per-BMC credentials and has a
+[BMC credential rotation mechanism](../../crates/credential-rotation/src/lib.rs).
+DPF credential delivery reuses those records and that mechanism.
 
-For every other ingestion, local ownership applies only to the site-wide
-version-0 key. During ingestion,
-NICo first reads the current site target and its committed authority: the
-acknowledged version-0 ownership epoch or the committed persistent target record
-for a later version. If version 0 has no acknowledged epoch, the site-wide fence
-resolves the configured source policy and finishes or resumes activation before
-the API accepts a device-scoped ingestion intent. If no credential resolves or
-activation cannot complete, ingestion returns a retryable
-credential-unavailable result without persisting the intent. After commit,
-ingestion never re-resolves environment, file, or backend precedence. A local
-epoch reads its named immutable snapshot even if the mutable source disappears;
-a backend epoch reads its exact writer, revision, and record identity. Once the
-applicable authority is ready, NICo persists the intent before it resolves or
-applies a BMC credential.
+`nico-api` derives a namespace-local Secret for each DPU through the existing
+credential-manager abstraction and references it from
+`DPUDevice.spec.bmcCredentialSecretName`. The Secret's `password` key reflects
+the credential confirmed on that device rather than the latest site-wide
+target. This keeps DPF access valid while devices use different credential
+versions.
 
-Activation is a persisted site-wide state machine with `prepared`, `published`,
-and `acknowledged` phases plus `cancelled` as a terminal alternative before
-publication. While holding the site-wide fence, `prepared` resolves the
-configured source exactly once. A local value is copied to a revision-named
-immutable Secret, and the operation records its snapshot ID, name, and UID; a
-backend value records its exact writer, revision, and record identity. An
-idempotent publish transaction makes version 0 current,
-binds it to that authority, and creates the ownership epoch. Every ready replica
-must then acknowledge the published epoch before the fence releases or ingestion
-can persist an intent. Restart resumes the recorded phase and reuses only the
-recorded authority. Cancellation is allowed only before publication after
-proving there is no target, intent, or managed owner; it removes an unreferenced
-prepared snapshot. A published epoch is retired only through the fenced rotation
-or recovery paths below, never by cancellation.
+The integration reconciles these Secrets after retries or restarts and
+coordinates credential changes with DPF so dependent operations use the
+matching password. DPF must support consuming credential updates safely before
+rotation is enabled for DPF-managed devices. Qualification and integration are
+tracked by [#6147](https://github.com/dsx-ai-factory/infra-controller/issues/6147);
+the supporting DPF behavior remains a prerequisite.
 
-The intent survives delayed or failed DPF registration and transitions to
-managed ownership after registration; that ownership remains
-until successful retirement. Before NICo changes hardware or creates a
-`DPUDevice`, the explicit cancellation path described below may clear a blocked
-intent after proving those side effects did not occur. NICo then applies the
-site target captured when the intent is created or atomically rebased before any
-side effect: the immutable snapshot name, UID, epoch, and snapshot ID for
-locally resolved version 0, or the persistent writer, credential revision, and
-record identity for every backend-resolved target, including backend version 0.
-NICo reads and applies only that intent-bound record. It never re-reads a
-mutable local source or re-resolves the generic backend chain after the intent
-commits. During intent preparation and before hardware dispatch, NICo also
-resolves the exact prior login credential, including an expected or factory
-credential when no per-device record exists, and stores it as an immutable,
-encrypted recovery record in the transactional writer. The intent pins that
-record's writer, revision, and identity. Intent acquisition fences mutation of
-the originating source until this snapshot commits; later source changes do not
-alter recovery. A missing prior credential blocks before hardware work, and the
-recovery record remains until the intent reaches a proven terminal state or an
-authorized force-abandon tombstone takes ownership. NICo then stages the
-resulting per-device BMC root through the persistent writer and records that
-staged identity and a pre-hardware phase in the intent, so failure to persist
-cannot follow a password change. After applying the intent-bound target, NICo
-authenticates with it and atomically makes the staged record active while
-advancing the intent phase.
-
-Restart recovery never repeats an uncertain change blindly. If the hardware
-step may have run but active-record commit did not, NICo authenticates with the
-captured target and the recorded prior credential under the host barrier. A
-working target completes verification and activates the staged record. A
-working prior credential either safely retries the recorded operation or
-restores the prior state according to its persisted phase. If neither
-authenticates, the intent remains blocked for documented out-of-band recovery.
-The same recovery runs before target advancement can classify that intent as an
-existing unconverged consumer. Thus the per-device record remains available
-even when the site-wide baseline is local, and no delayed intent applies its old
-captured target after a newer site target commits. After ingestion,
-`nico-api` derives an immutable, revision-named, namespace-local Secret for
-each DPU from that
-persisted credential and references it from the `DPUDevice`. For a new device,
-reconciliation creates the Secret first and creates the `DPUDevice` with its
-explicit reference already set; it never exposes a new resource that can fall
-back to the shared password. It then patches the Secret's Kubernetes
-`ownerReferences` to the new `DPUDevice`. For an existing device, restart-safe
-reconciliation creates or repairs the Secret before patching the reference and
-removes orphans left by deletion or partial creation.
-
-[#6147](https://github.com/dsx-ai-factory/infra-controller/issues/6147) adds an
-upstream host-wide DPF barrier with acquire, acknowledged-quiesced, controlled
-credential validation, release, and acknowledged-released transitions, plus the
-required NICo RBAC. Each request and acknowledgement carries a persisted
-operation ID. The barrier covers every sibling DPU because DPF has no per-device
-pause.
-
-The barrier arbiter serializes credential work with `DPUNodeMaintenance` and
-NodeEffect processing. A pending credential acquisition waits for active
-maintenance to drain; it does not prevent that maintenance from releasing. New
-maintenance waits while a credential barrier is held. The quiesced
-acknowledgement is emitted only after no maintenance is active and the affected
-lifecycle workers have paused. Persisted ownership restores this ordering after
-restart rather than allowing either workflow to infer that the other completed.
-
-Secret identity uses a globally non-reusable credential-revision ID persisted
-with the per-device credential and operation; the site-wide rotation version is
-not sufficient. Every accepted password change for a registered DPU allocates a
-fresh revision, while an ordinary restart reuses the persisted identity.
-Reconciliation never overwrites an immutable Secret or reuses an acknowledged
-identity.
-
-Point-in-time database recovery requires an operator-triggered restore mode. With
-NICo stopped, the procedure creates a globally unique external restore marker in
-Kubernetes outside the restored database, restores PostgreSQL and the credential
-Secret backups, then restarts NICo. The external restore marker defines a new
-external restore epoch and blocks normal DPF reconciliation before it can
-allocate a revision. Full-cluster
-backup exports credential Secrets without `ownerReferences`; restore applies
-those ownerless copies before any recreated `DPUDevice`, and NICo attaches the
-new owner UID only after validation. This prevents garbage collection through a
-stale owner UID. The backup destination encrypts these plaintext-bearing Secrets
-in transit and at rest with a key held outside the backup, limits and audits
-access as production credential access, and enforces the declared retention and
-secure-deletion window. Restore staging uses the same controls; an unencrypted
-or unverifiable credential-Secret backup is not accepted.
-
-While the external restore marker is active, restore mode holds the internal
-migration admission fence and compares the restored database with surviving or
-restored revision-specific Secrets. If a newer Secret authenticates to the BMC,
-NICo adopts it into the encrypted persistent record under the external restore
-epoch, then issues a fresh validation operation.
-If the restored credential authenticates, normal change-then-verify recovery may
-use it. If neither credential is available or valid, the device remains blocked
-for documented out-of-band BMC password recovery. NICo never guesses a value or
-overwrites hardware without a credential that first authenticates. A merely
-blocked device does not complete restore. Before NICo releases and acknowledges
-the internal migration admission fence and acknowledges the external restore
-marker, every device must either be adopted and rebound
-or enter the authorized force-abandon path. For a live `DPUDevice`, that path
-first persists a prepared force-abandon operation under the device reservation,
-then holds the host barrier until DPF acknowledges that lifecycle workers are
-quiesced and the resource and stale credential reference are removed. While the
-barrier remains held, it commits the tombstone and removes the credential from
-active ownership, then releases only after that commit is acknowledged. Restart
-resumes the prepared operation with the barrier effective. If the DPF resource
-cannot be quiesced or removed, restore stays blocked with the barrier and
-external restore marker held. The tombstone prevents later ingestion or mutation
-until out-of-band recovery. Only after those conditions hold does the operator
-clear the external restore marker. The database and authoritative credential
-Secrets share one declared backup and recovery window.
-
-This set includes every immutable local-v0 snapshot referenced by an ownership
-epoch and every revision-specific per-DPU Secret; restore applies them before
-NICo starts. Kubernetes assigns each restored Secret a new UID. While the
-external restore marker holds reconciliation, NICo validates a restored local-v0
-snapshot against every device still using it, then atomically records a new
-local-v0 ownership epoch within the external restore epoch and rebinds ownership
-to the new UID. The same transaction rebinds every surviving non-retired intent
-and managed-ownership reference from the restored epoch, snapshot UID, and ID to
-the replacement identity. A reference that cannot be proven and rebound keeps
-restore mode blocked unless the authorized force-abandon transition moves that
-consumer to its fenced tombstone and removes the active reference. When there
-are no version-0 consumers, the controller retires the old ownership epoch as
-unavailable instead of accepting an unprovable value. The same transaction
-clears the site-target reference when it still points to that epoch and records
-version 0 as uninitialized; it leaves a newer persistent target unchanged.
-
-Before retirement, every intent that captured that epoch must either have
-completed retirement or follow the persisted cancellation path after proving no
-hardware change and no `DPUDevice` creation; an intent with uncertain side
-effects counts as a consumer and requires validation. A later version-0
-initialization requires an explicit fenced operation that first proves the site
-target, every non-retired ingestion intent, and managed ownership no longer
-reference the retired epoch and that no force-abandon tombstone remains for any
-former consumer. If hardware validation fails or is unavailable while a
-consumer remains, version 0 stays blocked for operator recovery. The mutable
-`bmc-shared-password` projection is rebuilt only after rebinding and is not an
-independent backup source.
-
-This rule covers coordinated rotation and `bmc-machine set-root-password`; both
-persist intent, acquire the host barrier, and wait for quiescence before changing
-hardware. Direct per-MAC credential add or delete operations are rejected as
-soon as persisted ingestion or rotation intent exists, throughout every
-non-retired managed-ownership state, and while any force-abandon tombstone
-remains because they cannot coordinate hardware and persistence. Ownership or
-intent acquisition and a raw mutation use the same device-scoped database
-transaction, held from the
-no-intent check through both credential-writer and terminal-result commit. A
-writer that cannot participate in that transaction rejects raw per-MAC mutation
-during migration; its data must first move through the coordinated migration
-path. If the raw mutation wins, the transaction records its terminal add or
-delete result, writer, and credential-record identity. Ingestion reads that
-result and the writer directly instead of resolving the multi-backend fallback
-chain. A committed add names the exact writer record as an operator-provided
-current-credential candidate; ingestion validates it
-against the BMC and aborts without changing hardware if it fails. A committed
-delete is terminal absence for that operation, suppresses lower-priority
-fallback, and selects the normal site-target bootstrap path. After intent or
-managed ownership exists, DPF per-device reads remain on the recorded writer;
-the generic migration fallback contract is unchanged for other consumers. If
-intent wins, the raw mutation is rejected. Delayed or failed DPF registration
-therefore does not reopen the raw write path. Direct writes remain available
-only while the identity has no non-retired intent, managed ownership, active
-hardware consumer, or tombstone, including after verified normal retirement. A
-failed pre-ingestion
-candidate leaves the intent in a blocked state. An explicit cancellation
-operation may clear it only
-after proving NICo made no hardware change and created no `DPUDevice`;
-cancellation and the proof use the same reservation. The operator can then
-correct or delete the raw candidate and retry ingestion, which creates a new
-operation ID and re-reads the terminal mutation state. Restart resumes either
-the blocked intent or the persisted cancellation instead of clearing it
-opportunistically.
-
-Before replacing the first outgoing replica, the orchestrator persists an
-external legacy admission fence that blocks ingestion, manual BMC password
-changes, rotation, raw per-MAC writes, DPU registration, deletion, resource
-creation, and credential-reference repair before they reach an API or Kubernetes
-reconciler. Fence activation atomically closes those entry points and records a
-durable grandfather set of active work from the outgoing deployment. The
-external admission layer assigns each entry a fence-owned operation ID from the
-outgoing pod UID and stable device or resource identity, so an older release
-does not need to understand the new intent protocol. Only authenticated writes
-that map to an entry and are required to reach its recorded safe terminal state
-may pass; the entry closes at that state. If active work cannot be identified,
-the rollout stays in pre-replacement recovery and no old pod exits. The
-orchestrator waits for the grandfather set to drain or complete
-change-then-verify recovery while the old pods remain alive. Failure to drain
-keeps only the external legacy admission fence held; a
-persisted recovery or cancellation path finishes the operation before that
-fence can release, so rollout does not pause a dependency needed for recovery.
-The fence also grants the authenticated migration controller a narrowly scoped
-exception for writes tagged with the persisted rollout operation ID, which
-remains stable across repair and retry attempts. Each attempt has a nested ID
-for staging and audit, but fence admission never changes owners between
-attempts. The rollout identity may stage and publish the fencing epoch, backfill or repair the
-per-DPU Secrets and references, and perform the documented downgrade cleanup;
-it cannot admit ordinary API requests or unrelated lifecycle work. Fence
-enforcement validates the controller identity and operation ID, and every such
-write remains idempotent and auditable under that operation.
-
-After the admitted operations drain, the orchestrator acquires an external DPF
-lifecycle gate that outgoing API replicas cannot bypass. DPF acknowledges that
-gate only after it pauses new processing of existing `DPUNodeMaintenance` and
-NodeEffect resources and drains their active lifecycle workers. Inability to
-prove DPF quiescence aborts replacement with both gates held; cancellation
-releases and acknowledges the external DPF lifecycle gate before the external
-legacy admission fence. Both gates survive orchestrator restart and remain
-active across pod replacement. Before
-the external legacy admission fence is acknowledged, it also freezes mutation of watched local
-BMC source objects and denies legacy refresh writers from updating
-`bmc-shared-password`; only the controller operation holding the external legacy
-admission fence may update the projection. This closes background paths that do
-not enter the ordinary API request path.
-
-The supported predecessor upgrade then uses a planned maintenance outage as the
-enforcement boundary the old binary cannot bypass. With both external gates
-held, the orchestrator removes mutating service endpoints, stops every outgoing
-API, controller, and worker workload that can write PostgreSQL, Kubernetes, or
-Redfish, terminates their database sessions, and proves that no outgoing pod or
-session remains. It enumerates any operation that began before shutdown from the
-persisted operation records; an uncertain Redfish side effect must complete
-change-then-verify recovery under the compatibility release before backfill.
-Migration does not begin with an old writer alive. Failure to prove quiescence
-keeps the gates held and aborts replacement for operator recovery.
-
-The per-DPU rollout then deploys a compatibility release that understands the
-internal migration admission fence but does not activate backfill. Migration activation
-requires a capability heartbeat from every ready `nico-api` replica and no pod
-from the outgoing deployment revision. If membership changes or an incapable
-replica appears, acknowledgement is withdrawn and migration work holds. The
-orchestrator does not roll back to an incapable release until controlled
-downgrade completes. The compatibility release retains only the legacy
-registered-DPU rejection check while outgoing replicas remain and does not
-activate intent-based behavior.
-
-On a new site with no outgoing API revision, existing DPU, or stored per-device
-credential, the compatibility release is the initial release. The external
-gates, old-operation drain, and device backfill are empty steps. Before
-DPF ingestion is enabled, every ready replica still acknowledges the capability
-and a persisted intent-fencing epoch with an empty device-ownership and mutation
-baseline. Site-target ownership remains separately required at ingestion, so a
-credential supplied later follows the local or backend activation path above.
-Target absence is valid only for this acknowledged empty baseline; the first
-ingestion cannot persist its intent until activation publishes a target.
-
-After the capability and outgoing-pod checks pass, the migration installs a
-persisted internal migration admission fence that blocks new BMC password operations, raw per-MAC
-writes, ingestion, DPU registration, deletion, resource creation, and
-credential-reference repair.
-Already-active operations are grandfathered and drain to a safe terminal state;
-an unknown or changed-hardware rotation completes change-then-verify recovery
-rather than being cancelled. Every ready replica must acknowledge the internal
-fence, but the orchestrator retains the external legacy admission fence through epoch
-commit. The same authenticated, stable-rollout-ID migration exception applies
-to the internal fence. Once lifecycle work is quiesced, the controller
-enumerates every ingested host, DPU, network switch, and power shelf whose
-hardware-confirmed credential is version 0 and backfills its durable binding to
-the candidate ownership epoch. For each DPU it also backfills managed ownership
-for the existing `DPUDevice` or persisted ingested DPU. It
-also enumerates every known or stored pre-ingestion per-MAC key, resolves its
-effective migration-chain value once under the fence, stages any value in the
-transactional writer, and records either that staged record or terminal absence
-as the fencing baseline. For a legacy site whose target is version 0 but has no
-ownership epoch, the controller also resolves the exact effective value, stages
-it in the transactional writer
-when necessary, and records its writer, revision, and record identity as the
-candidate backend ownership epoch. The version-0 target is staged to reference
-that candidate epoch. If the target has already advanced, the controller instead
-resolves the exact current-version record from the persistent writer and stages
-its writer, revision, and record identity as the target authority. Migration
-never rewrites the numeric target. On any site with legacy device, credential,
-or mutation state, a missing target or missing or ambiguous current target
-record keeps backfill blocked. Staged records and target bindings
-are invisible to the credential reader until the fencing epoch atomically
-publishes them. Missing or ambiguous ownership or baseline state persists a
-backfill-blocked result. The operator may repair it
-under the fence by authenticating a selected credential through the host
-barrier. Otherwise cancellation discards the uncommitted fencing epoch and all
-of its staged writer records while retaining the legacy registered-DPU guard.
-That transaction also records the old attempt cancelled and creates a new
-attempt ID under the same stable rollout operation ID. The external and internal
-fence exceptions therefore remain valid without ownership transfer. Because
-the compatibility release has not yet activated durable intent semantics, both
-external gates remain held and normal ingestion, raw writes, and hardware work
-stay blocked. Every ready replica acknowledges the new attempt generation before
-repair or retry writes begin; restart sees either the old attempt with staging
-or the new attempt without staging, never a stale exception. The only pre-commit path that
-releases them is an explicit rollout rollback: restore and
-verify the outgoing revision and prior source policy, release and acknowledge
-the external DPF lifecycle gate, then release and acknowledge the external legacy admission fence.
-Failure at any rollback or release phase remains safely fenced.
-
-On success, the controller atomically publishes the staged records
-and commits the intent-fencing epoch together with an incomplete-migration
-marker, any candidate backend ownership epoch, and its
-staged site-target authority binding in one transaction. Every ready replica
-acknowledges the committed fencing, ownership, and target state. On the initial
-rollout, the internal migration admission fence and both external gates remain held while
-the controller immediately runs preflight and per-DPU Secret backfill. The
-deployment guard prevents an incapable replica from serving; membership or
-capability changes keep the gates active.
-
-Preflight requires rotation to be fully converged. A pending or quarantined
-device makes the controller persist cancellation and release and acknowledge
-the internal migration admission fence. If the external gates remain from initial rollout, it then
-releases and acknowledges the external DPF lifecycle gate followed by the
-external legacy admission fence. Normal work resumes only after every applicable release is
-acknowledged. The incomplete-migration marker remains: it blocks general rotation
-and site-target advancement but permits marker-scoped recovery and convergence
-to the frozen target, unrelated normal work, and new durable-intent ingestion at
-the unchanged target. A convergence operation may be created only for a device
-recorded below that target, carries the marker ID, and cannot change the target
-or choose another credential. That ingestion never reopens
-the raw write path merely because a device predates ingestion intent. Retry uses
-a new operation ID and, after capability and deployment-revision checks,
-acquires and acknowledges a new persisted internal migration admission fence before
-preflight or backfill. With no outgoing incapable replica, it does not reacquire
-the legacy external gates.
-
-On successful preflight, the internal migration admission fence remains held through per-DPU Secret
-backfill. For each shared-credential device, NICo creates the candidate
-revision-specific Secret
-and asks DPF to validate it under the host barrier before patching the
-`DPUDevice` reference. Only a matching fresh acknowledgement permits the patch.
-`status.bmcCredentialSecretName` reflects the last successful Secret but is not
-by itself a fresh acknowledgement.
-
-A validation failure or timeout leaves that device on the shared credential,
-records the candidate as quarantined, revalidates the shared Secret with the
-same operation, and releases its host barrier only after that acknowledgement.
-After every host is safe, the controller cancels and releases and acknowledges
-the internal migration admission fence and, when still held, releases and
-acknowledges the external gates in DPF-then-admission order. It retains the
-existing incomplete-migration marker. Devices already
-converted keep their explicit references, while the operator repairs the failed
-credential and retries under a newly acknowledged internal migration admission fence. After every
-`DPUDevice` has an explicit reference and matching validation acknowledgement,
-the controller clears the marker, releases and acknowledges the internal migration admission fence,
-and releases any external gates still held in the same DPF-then-admission order.
-
-Rotation atomically acquires the site-wide fence and persists its operation in
-one transaction; if activation already owns the fence, no active rotation record is
-published. It then takes its device reservation and only then acquires the host
-barrier before changing the password. The site-wide fence and reservation remain
-held through terminal-result commit. Restart
-recovery reconciles hardware and the per-device backend, creates the new
-revision-specific Secret, patches the reference, and requests
-validation while lifecycle work remains quiesced. The old Secret remains until
-the matching validation acknowledgement; reconciliation then deletes it and
-waits for release acknowledgement. A failure proven to precede the hardware
-change keeps the old reference, records quarantine, requests a fresh validation
-correlated with the operation, and releases only after that acknowledgement. An
-unknown or changed-hardware outcome keeps the barrier held while
-change-then-verify recovery completes.
-
-Decommission, DPU deletion, and force deletion first persist delete intent and
-block new credential operations. They do not delete the `DPUDevice`, its status,
-or its owner Secrets until an active credential operation reaches a safe terminal
-state and releases its barrier. An explicit force-abandon path records a
-prepared force-abandon operation under the device reservation, acquires and
-holds the host barrier through removal of the `DPUDevice` and stale credential
-reference, then commits the tombstone and active-ownership removal. Restart
-resumes that prepared operation, and the barrier releases only after the commit
-is acknowledged. Normal retirement
-transitions managed ownership to retired only after resource removal, Secret
-cleanup, and credential consistency are persisted under the device reservation;
-the same commit archives the prior intent and terminal mutation baseline as
-audit-only and clears their active binding. Only then can pre-ingestion raw
-writes reopen for that identity, and later ingestion creates a new operation and
-baseline. Force-abandon keeps its tombstone fenced until documented out-of-band
-recovery confirms the hardware credential before a later ingestion or raw
-mutation.
-
-Clearing a tombstone is a separate operator-authorized recovery operation; no
-generic delete can clear it. The controller persists the recovery operation,
-takes any applicable site-wide fence, then the device reservation, and then the
-host DPF barrier when the resource still exists. Restart recovery preserves this
-global order and never reacquires an earlier lock while holding a later one. The
-operator supplies an exact current credential or a verifiable out-of-band reset result. NICo must
-authenticate to the hardware or verify the controlled reset before it atomically
-binds the proven credential to new managed ownership, or records the recovered
-identity as safely unowned after resource removal. The same commit retires the
-old recovery record and clears the tombstone. Failure before commit leaves the
-tombstone effective; restart after commit resumes acknowledgement and releases
-the host barrier and fences only after every applicable owner observes the new
-state. If hardware state cannot be proven, the tombstone remains.
-
-Controlled downgrade is serialized with upgrade by one persisted rollout
-operation. Before preflight or any incapable pod starts, the orchestrator
-persists the external legacy admission fence, drains its grandfathered
-operations, acquires and acknowledges the external DPF lifecycle gate, and then
-installs the internal migration admission fence. The internal fence blocks and
-drains every new password mutation, ingestion and ingestion-intent acquisition,
-registration, deletion, and reference repair. Restart reacquires no earlier
-gate while holding a later one. All gates remain held through persisted handoff,
-so no new intent can appear after preflight. The preflight rejects
-pending or quarantined devices and any unresolved force-abandon tombstone; an
-older release cannot run until out-of-band recovery clears every tombstone.
-Every non-retired ingestion intent must also finish into managed ownership or
-follow the no-side-effect cancellation path before handoff. It also requires
-every persisted per-device credential to equal the proposed shared credential;
-a common rotation version is not proof of equality.
-
-While every per-DPU reference remains in place, preflight also writes or verifies
-the exact shared credential in the persistent backend selected by the older
-release's read precedence. The downgrade operation records the prior backend
-identity and encrypted value before replacement, then validates the staged
-result through the older release's configured reader contract. Failure, or an
-unavailable legacy backend, rejects downgrade and restores the prior backend
-state. A pre-commit cancellation does the same. Only a forward downgrade commit
-retains the legacy-readable value. The downgraded configuration must omit or
-disable any local BMC override so the older release resolves that validated
-backend record; if this cannot be enforced, downgrade is rejected. Rejection persists
-cancellation and waits for release acknowledgement before normal work resumes.
-
-After successful preflight, persisted per-host phases synchronize the shared
-Secret, remove references under the barrier, and require operation-correlated
-validation of `bmc-shared-password`. Per-DPU Secrets remain until commit. Before
-the first reference is removed, cancellation restores the prior shared Secret
-and releases and acknowledges the internal migration admission fence followed
-by the external DPF lifecycle gate and external legacy admission fence. After
-that point, restart recovery proceeds forward by default; an explicit rollback
-restores every retained per-DPU reference and its matching validation
-acknowledgement, the prior shared Secret, and the recorded
-prior backend identity and encrypted value before releasing all applicable
-gates. Registration remains quiesced until every barrier release is
-acknowledged and either the older release is running on the shared contract or
-rollback has completed. Successful handoff atomically commits a downgrade
-generation that supersedes the local-v0 ownership and intent-fencing epochs as
-active authority while retaining their audit history. The same transaction
-marks the internal migration admission fence superseded and released; every
-ready new-release replica acknowledges that terminal state before its pod exits.
-A later upgrade treats that generation as requiring fresh capability
-acknowledgement, admission fencing, ownership and baseline backfill; it never
-revives the superseded epochs. The orchestrator
-releases and acknowledges the external DPF lifecycle gate and then the external
-legacy admission fence only after that commit, every new-release pod is gone,
-and the older release owns the validated shared contract. Rollback holds both
-external gates until compatible replicas have restored and acknowledged the
-internal migration admission fence. DPF never receives access to the credential
-file, PostgreSQL, or the rotation table.
+Initial version-0 bootstrap retains the
+[Credential Sources](../configuration/credential-sources.md) contract;
+version 1 and later use the persistent backend. Derived Secrets have
+least-privilege access and are cleaned up with their device references. DPF
+reads those Secrets and receives no direct access to credential files,
+PostgreSQL, or rotation bookkeeping.
 
 ## 4. Provider Enablement and Optional Migration Order
 
@@ -906,48 +443,27 @@ file, PostgreSQL, or the rotation table.
    node-credential revocation or disablement before relying on JWT as the only
    machine-authentication path. Removing Vault from the site is a separate,
    later operator decision.
-6. **Roll out per-DPU BMC credentials.** First make PostgreSQL the credential
-   writer and highest-priority backend; Vault may remain selected for PKI,
-   Transit, or lower-priority credential reads, but it cannot write this flow
-   because the credential record, ingestion intent, and terminal result must
-   commit in one database transaction. Persist the external legacy admission
-   fence, drain its enumerated old operations, then acquire and acknowledge the
-   external DPF lifecycle gate. Enter the planned maintenance window, remove
-   mutating endpoints, stop every outgoing API, controller, and worker workload,
-   terminate its database sessions, and prove that no old writer remains. Start
-   the fence-compatible release at its full replica count without a rolling
-   overlap and without activating migration. After capability and
-   deployment-revision checks pass, install and acknowledge the
-   internal migration admission fence. Before the DPF lifecycle gate is
-   acquired, a drain failure retains only the legacy admission fence through
-   recovery or cancellation. A pre-start quiescence failure releases the DPF
-   lifecycle gate before the legacy admission fence. After the compatibility
-   release starts and before the intent-fencing epoch commits, a failed attempt keeps
-   both external gates through repair and retry; only a verified rollback to the
-   outgoing revision releases them. After epoch commit,
-   retain all gates while running converged-rotation preflight and creating and
-   acknowledging every revision-specific per-DPU Secret. On success or a safely
-   cancelled post-commit attempt, release the external DPF lifecycle gate before
-   the external legacy admission fence; a later retry reacquires only the
-   internal migration admission fence. Enable the persisted host-wide barrier before versioned BMC
-   rotation is allowed.
-   Validate controlled downgrade while the new reconciler remains installed. On
-   a new site, install that release initially, skip the empty legacy drain and
-   backfill, and acknowledge its capability and empty intent-fencing baseline
-   before enabling DPF ingestion.
+6. **Integrate per-DPU BMC credential delivery.** Adopt and validate supporting
+   DPF behavior, reconcile per-DPU Secrets from existing per-BMC credentials,
+   and attach their references to `DPUDevice` resources. Verify safe handoff
+   during rotation, restart, and failure recovery before enabling BMC rotation
+   on DPF-managed devices. The existing shared-Secret bootstrap remains
+   supported while [#6147](https://github.com/dsx-ai-factory/infra-controller/issues/6147)
+   is pending.
 7. **Make installation provider-driven.** `helm-prereqs` phases and chart
    defaults deploy the Vault AppRole and token Secrets, `vault-cluster-info`
    ConfigMap, and Vault-backed issuer only when a selected provider requires
    them. New and existing sites may select Vault for credentials, Transit, PKI,
    or any combination. A site using only independent providers can omit Vault.
-   DPF starts in the initial Core rollout without a BMC
-   credential, after step 6 has installed its ingestion fence. An operator may
-   supply version 0 through the local environment/file chain before that rollout,
-   including a watched Secret when no environment entry overrides it, or
-   populate a configured persistent backend afterward. The local path needs no
-   admin credential. The persistent path uses the operator's normal admin mTLS
-   credential and credential API, but neither path requires an installer-created
-   temporary credential, an in-cluster CLI job, or a second Core rollout.
+   DPF initializes in the initial Core rollout. An operator may supply
+   version 0 through the local environment/file chain, including a watched
+   Secret, or populate a configured persistent backend through the normal
+   credential API. Local startup requirements and source precedence remain
+   defined by [Credential Sources](../configuration/credential-sources.md).
+   New DPU registration waits for credential delivery. The local path needs no
+   admin credential; the API path uses the operator's normal admin mTLS
+   credential. Neither path requires an installer-created temporary
+   credential, an in-cluster CLI job, or a second Core rollout.
 8. **Verify each selected provider combination.** Prove startup, steady-state
    operation, rotation, backup restore, rollback, and failure recovery for the
    configured credential, KMS, authentication, and PKI providers. A deployment
@@ -961,16 +477,15 @@ file, PostgreSQL, or the rotation table.
 Steps 4 and 5 can be developed and selected independently. KMS-provider
 migration uses the re-wrap and overlap procedure above. Selecting the same-CA
 cert-manager path changes certificate issuance configuration without a CA or
-trust migration. Step 6 can proceed independently of those provider choices. A
-predecessor site's shipped shared-Secret
-local-v0 bootstrap remains supported while step 6 is pending, but rotation stays
-blocked; step 6 must complete before per-DPU credential delivery, mixed-version
-convergence, or versioned BMC rotation is enabled. For a new site, step 7 depends on
-steps 2 through 5 plus step 6's capable release and empty-baseline
-initialization, not step 6's upgrade-specific drain and backfill. DPF BMC
-bootstrap no longer introduces an admin CLI dependency. Step 8 validates the
-combination selected by the operator; it does not require removal of Vault.
-Step 9 depends on step 4 but can otherwise proceed independently.
+trust migration. Step 6 can proceed independently of those provider choices;
+BMC rotation on DPF-managed devices remains unsupported until its integration
+is qualified. For a new site omitting Vault, step 7 depends on the applicable
+independent-provider work in steps 2 through 5. Provider-driven installation
+in step 7 can retain the shared-Secret bootstrap while per-DPU delivery
+(step 6) is pending. DPF BMC bootstrap does not
+introduce an admin CLI dependency. Step 8 validates the combination selected
+by the operator; it does not require removal of Vault. Step 9 depends on step 4
+but can otherwise proceed independently.
 
 ## 5. Failure, Security, and Availability Boundaries
 
@@ -1029,15 +544,15 @@ Step 9 depends on step 4 but can otherwise proceed independently.
   [Secrets Storage](../configuration/secrets-storage.md) defines why inline key
   material is limited to development and test.
 - The operator-managed local BMC credential chain owns only version 0, with the
-  environment source ahead of the watched file. Its Kubernetes Secret and
-  DPF's derived per-device Secrets are namespace-local and independently
-  access-controlled. Once a non-retired ingestion intent or active version-0
-  consumer references the active epoch, changing the local value is not a
-  supported rotation because a consumer may already depend on it; version 1 and later stay in the persistent
-  backend. Retired audit history does not prevent a fenced new baseline after
-  the retirement checks pass. Each registered
-  `DPUDevice` continues to reference the credential matching that device while
-  coordinated rotation leaves the fleet on mixed versions.
+  environment source ahead of the watched file. Once a managed device uses
+  that value, changing the local source is not a supported hardware rotation;
+  version 1 and later stay in the persistent backend. Local credential Secrets
+  and DPF's derived per-device Secrets are namespace-local and independently
+  access-controlled. Production deployments require encryption at rest for
+  credential Secrets and encrypted, access-controlled backups with audited
+  access and documented retention. Each `DPUDevice` references the credential confirmed on
+  that device, and DPF credential updates must be qualified before rotation is
+  enabled for DPF-managed devices.
 - Provider credentials use workload identity or mounted secret sources where
   supported and are independently rotatable from the data they protect.
 - Multi-replica NICo deployments use shared PostgreSQL state and highly
@@ -1081,10 +596,9 @@ The overall effort is complete when a supported site can:
   selecting the same-CA cert-manager path, without forced rotation or
   reissuance;
 - preserve machine identity and RBAC behavior through migration;
-- optionally move from a Vault-backed deployment without credential loss, using
-  the documented maintenance outage only for supported predecessor DPF
-  conversion; credential, KMS, and PKI provider cutovers remain
-  authentication-outage-free;
+- optionally move from a Vault-backed deployment without credential loss;
+  credential, KMS, and PKI provider cutovers preserve authentication
+  availability;
 - demonstrate rollback at every credential or KEK provider-overlap stage and
   prove the same-CA cert-manager path before selecting direct signing; and
 - protect machine-identity signing keys with the shared envelope and the
@@ -1115,11 +629,9 @@ The overall effort is complete when a supported site can:
    window remains supported? This
    decision is tracked by
    [#5958](https://github.com/dsx-ai-factory/infra-controller/issues/5958).
-6. What Kubernetes resource represents the external DPF restore marker and its
-   acknowledgement? This decision is tracked by
-   [#6147](https://github.com/dsx-ai-factory/infra-controller/issues/6147).
-7. Does the host-wide DPF credential barrier extend `DPUNodeMaintenance` or use
-   a new DPF API? This decision is tracked by
+6. Which DPF release and API safely consume per-device credential updates,
+   and how does NICo verify that DPF uses the updated credential before
+   allowing dependent operations? This decision is tracked by
    [#6147](https://github.com/dsx-ai-factory/infra-controller/issues/6147).
 
 ## 8. Implementation Status
@@ -1142,11 +654,17 @@ before a dependency owned by another epic.
 | Phase 1 credential-storage boundary | After [#195](https://github.com/dsx-ai-factory/infra-controller/issues/195), credentials can be authoritative in PostgreSQL while their per-record DEKs remain wrapped by a KEK in Vault/OpenBao Transit. PostgreSQL replaces Vault as the credential database but intentionally leaves KEK custody behind the KMS-provider boundary. | [#3253](https://github.com/dsx-ai-factory/infra-controller/issues/3253) adds and qualifies the KMIP provider alongside Transit. Sites can keep Transit or route new wraps to KMIP, re-wrap live records, and retain the prior provider through rollback and backup-retention windows. |
 | Services outside `nico-api` | Phase 1 made the `nico-api` chain Vault-optional, but the default chain used by `dsx-exchange-consumer` still constructs a Vault client, persistent `powershelf-manager` and `nvswitch-manager` deployments still use Vault credential managers, and the `bmc-proxy` chart still injects Vault configuration. The `machine-a-tron` Vault values are stale and unused rather than a runtime dependency. | [#5957](https://github.com/dsx-ai-factory/infra-controller/issues/5957) covers the DSX Exchange and chart work; [#5954](https://github.com/dsx-ai-factory/infra-controller/issues/5954) covers the persistent REST credential backends. |
 | Legacy Flow upgrade and cleanup | The current chart is Flow-only, but a site still running the predecessor three-container deployment cannot resume setup until an operator upgrades Flow. Its legacy Vault resources remain until setup resumes. | The Flow-only chart, fail-closed guard, and cleanup landed in the [Flow-only deployment implementation](https://github.com/dsx-ai-factory/infra-controller/pull/5325), tracked by [#5324](https://github.com/dsx-ai-factory/infra-controller/issues/5324). After the operator completes and verifies the supported Flow upgrade, setup removes the stranded security resources while Vault is still available. |
-| DPF BMC credential delivery | [#6487](https://github.com/dsx-ai-factory/infra-controller/pull/6487) removed the Vault-issued temporary admin credential, in-cluster CLI job, and two-stage rollout. The BMC version-0 source selector and watched Secret are shipped, but the target-wide `bmc-shared-password` projection cannot represent a fleet on mixed credential versions. | [#6147](https://github.com/dsx-ai-factory/infra-controller/issues/6147) adds the durable ingestion intent and ownership fence plus per-DPU credential Secrets so each registered device remains usable during rotation and coordinated cleanup is safe. |
+| DPF BMC credential delivery | [#6487](https://github.com/dsx-ai-factory/infra-controller/pull/6487) removed the Vault-issued temporary admin credential, in-cluster CLI job, and two-stage rollout. The BMC version-0 source selector and watched Secret are shipped, but the target-wide `bmc-shared-password` projection cannot represent a fleet on mixed credential versions. | [#6147](https://github.com/dsx-ai-factory/infra-controller/issues/6147) qualifies supporting DPF behavior and integrates per-DPU Secrets with the existing per-BMC credential records and rotation mechanism. |
 | Initial phase 2 JWT boundary | [#355](https://github.com/dsx-ai-factory/infra-controller/issues/355) provides bearer JWTs and permits machine mTLS to be disabled at the transport-authentication layer, but the JWT is still signed with the Vault-issued mTLS certificate key and carries that certificate chain. The validator does not enforce individual certificate revocation, so certificate expiry or CA-wide rotation is the containment path for a compromised key. | [#5956](https://github.com/dsx-ai-factory/infra-controller/issues/5956) adds selectable cert-manager issuance and renewal using the same CA, without replacing the current certificate or key when the provider is selected, and adds API-side individual disablement or revocation enforcement. Sites may retain Vault PKI. |
 | Phase 2 agent boundary versus CLI | Scout and DPU-agent can use JWT while the admin CLI continues to use mTLS. The CLI may keep its Vault-issued credential or use a certificate from an operator-managed external admin CA through the existing trust and CLI inputs. | [#5955](https://github.com/dsx-ai-factory/infra-controller/issues/5955) documents and validates issuance, renewal, revocation, and recovery for the independent admin credential. |
 | Certificate-provider separation boundary | [#2880](https://github.com/dsx-ai-factory/infra-controller/issues/2880) separates certificate vending from credential storage, but the production certificate-provider implementations remain Vault-backed. | [#5956](https://github.com/dsx-ai-factory/infra-controller/issues/5956) adds cert-manager as a selectable provider for node, UFM, service-transport, and optional NVSwitch issuance and retains the already-direct optional DPU OTLP gateway issuer. Reference sites use the same `site-root` CA and key on both paths, so selection preserves existing trust, certificates, keys, Secrets, and mounts. A custom site whose CA or key does not match remains on Vault PKI. |
 | Production KMS before encryption convergence | After [#3253](https://github.com/dsx-ai-factory/infra-controller/issues/3253), the PostgreSQL envelope and the machine-identity encryption-key credential can both use either Transit or a qualified KMIP server, but machine-identity signing keys still use a separate encryption primitive. | [#3255](https://github.com/dsx-ai-factory/infra-controller/issues/3255) converges machine-identity encryption on the shared KMS envelope without requiring a change of KMS provider. |
+
+Until [#6147](https://github.com/dsx-ai-factory/infra-controller/issues/6147)
+is qualified, the DPF rotation restriction is operator guidance rather than an
+API guard. Operators must not stage BMC rotation while DPF manages any DPU;
+see [DPF BMC bootstrap](../manuals/dpf.md#36-set-the-site-wide-bmc-root-credential)
+and [Credential Sources](../configuration/credential-sources.md#site-wide-bmc-root-version-0-ownership-policy).
 
 ### 8.2 Work-Item Status
 
@@ -1159,7 +677,7 @@ before a dependency owned by another epic.
 | Node bearer JWT and dual-auth rollout | Implemented, with the Vault-issued mTLS certificate key as the intermediate signing credential | [#355](https://github.com/dsx-ai-factory/infra-controller/issues/355), [Node-auth bearer JWTs](machine-identity/node-auth-jwt.md) |
 | IRoT identity and API-issued refresh | Never merged; closed as not planned because the DPU OS cannot access the IRoT key and so cannot prove possession; the merged JWT path instead re-mints locally with the node certificate key | [#2917](https://github.com/dsx-ai-factory/infra-controller/issues/2917), [#3254](https://github.com/dsx-ai-factory/infra-controller/issues/3254) |
 | Admin CLI authentication | Existing Vault-issued mTLS remains supported; the independent operator-managed mTLS certificate lifecycle is open; DPF bootstrap no longer depends on the CLI | [#5955](https://github.com/dsx-ai-factory/infra-controller/issues/5955) |
-| Per-DPU BMC credentials | Open; includes durable ingestion intent, raw-write exclusion, backend-v0 epoch and device-ownership backfill, recovery, the DPF barrier, restore rebinding, and revision-specific Secrets for mixed-version rotation | [#6147](https://github.com/dsx-ai-factory/infra-controller/issues/6147) |
+| Per-DPU BMC credentials | Blocked on supporting DPF behavior; integration reuses existing per-BMC credentials and rotation with per-DPU Secret delivery, reconciliation, and safe credential updates | [#6147](https://github.com/dsx-ai-factory/infra-controller/issues/6147) |
 | Certificate-provider separation | Implemented; production providers remain Vault-backed | [#2880](https://github.com/dsx-ai-factory/infra-controller/issues/2880), [implementation](https://github.com/dsx-ai-factory/infra-controller/pull/2881) |
 | Selectable cert-manager certificate provider | Open; Vault PKI remains supported, and cert-manager with the same `site-root` CA and signing key is the independent option. A new Rust Kubernetes-resource abstraction uses in-memory keys and CSR-only `CertificateRequest` resources for dynamic node and UFM issuance; existing trust, leaves, keys, Secrets, and mounts remain unchanged. Issuance policy and API-side enforcement of individual node-signing credential disablement or revocation remain required. | [#5956](https://github.com/dsx-ai-factory/infra-controller/issues/5956) |
 | Provider-driven installation and bootstrap | Open for selecting the chart and runtime credential, KMS, and PKI providers; the DPF BMC version-0 bootstrap path already has no Vault dependency | [#5958](https://github.com/dsx-ai-factory/infra-controller/issues/5958), [#6147](https://github.com/dsx-ai-factory/infra-controller/issues/6147) |
