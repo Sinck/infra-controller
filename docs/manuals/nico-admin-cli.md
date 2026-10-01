@@ -31,9 +31,11 @@ The CLI needs three things to connect:
 ### TLS options
 
 Settings prefer CLI flags, then environment variables, then config-file keys,
-then defaults or file-location fallbacks. Supply the client certificate and key
-together: an incomplete flag/environment pair falls back to the complete
-config-file pair, then the [client-cert fallbacks](#client-cert-fallbacks).
+then defaults or file-location fallbacks. The client certificate and key resolve
+independently. When both values are present, the CLI uses that pair, even when
+one comes from a CLI flag and the other from an environment variable. When either
+is absent, it uses the complete config-file pair, then the
+[client-cert fallbacks](#client-cert-fallbacks).
 
 | Setting | CLI flag | Environment variable | Config file key | Default |
 |---------|----------|---------------------|-----------------|---------|
