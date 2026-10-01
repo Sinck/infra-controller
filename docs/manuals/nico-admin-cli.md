@@ -37,7 +37,7 @@ config-file pair, then the [client-cert fallbacks](#client-cert-fallbacks).
 
 | Setting | CLI flag | Environment variable | Config file key | Default |
 |---------|----------|---------------------|-----------------|---------|
-| API URL | `-a` / `--api-url` | `API_URL` | `api_url` | `https://carbide-api.forge-system.svc.cluster.local:1079` |
+| API URL | `-a` / `--api-url` | `API_URL` | `api_url` | `https://nico-api.forge-system.svc.cluster.local:1079` |
 | Server root CA | `--root-ca-path` | `ROOT_CA_PATH` | `root_ca_path` | — |
 | Client cert | `--client-cert-path` | `CLIENT_CERT_PATH` | `client_cert_path` | see [Client-cert fallbacks](#client-cert-fallbacks) |
 | Client key | `--client-key-path` | `CLIENT_KEY_PATH` | `client_key_path` | same chain as client cert |
