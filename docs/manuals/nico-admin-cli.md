@@ -30,12 +30,14 @@ The CLI needs three things to connect:
 
 ### TLS options
 
-Every setting follows the same priority: CLI flag → environment variable →
-config file key → hard-coded default (where one exists).
+Settings prefer CLI flags, then environment variables, then config-file keys,
+then defaults or file-location fallbacks. Supply the client certificate and key
+together: an incomplete flag/environment pair falls back to the complete
+config-file pair, then the [client-cert fallbacks](#client-cert-fallbacks).
 
 | Setting | CLI flag | Environment variable | Config file key | Default |
 |---------|----------|---------------------|-----------------|---------|
-| API URL | `-a` / `--api-url` | `API_URL` | `api_url` | `https://nico-api.forge-system.svc.cluster.local:1079` |
+| API URL | `-a` / `--api-url` | `API_URL` | `api_url` | `https://carbide-api.forge-system.svc.cluster.local:1079` |
 | Server root CA | `--root-ca-path` | `ROOT_CA_PATH` | `root_ca_path` | — |
 | Client cert | `--client-cert-path` | `CLIENT_CERT_PATH` | `client_cert_path` | see [Client-cert fallbacks](#client-cert-fallbacks) |
 | Client key | `--client-key-path` | `CLIENT_KEY_PATH` | `client_key_path` | same chain as client cert |
@@ -83,7 +85,7 @@ with a "Only SOCKS5 Proxy supported" error. This is enforced in
 
 ```sh
 export https_proxy=socks5://localhost:1080
-nico-admin-cli machine show --all
+nico-admin-cli machine show
 ```
 
 ### Client-cert fallbacks
@@ -119,21 +121,24 @@ writes logs to **stderr**, leaving stdout for command output:
 
 ## Quick verification
 
-Once credentials are in place, `version` is the cheapest end-to-end check —
-it exercises auth without mutating anything:
+Use `version` for a read-only connectivity check:
 
 ```sh
 nico-admin-cli version
 ```
 
-If it succeeds, the API URL, root CA, and client cert/key are all working.
-`nico-admin-cli machine show --all` is a good first real query.
+This command does not verify the server certificate, sends no client
+certificate, and is allowed anonymously. Success does not verify server trust,
+the client cert/key, or admin permissions. With credentials configured and
+`DISABLE_TLS_ENFORCEMENT` unset, use `nico-admin-cli machine show` to verify a
+protected, read-only operation. An empty inventory is also a valid result.
 
 ## mTLS and authorization
 
-For generating client certificates, configuring the server-side TLS and
-Casbin policy, and understanding how certificate fields map to authorization
-roles, see [NICo mTLS and authorization](./nico-api-auth.md).
+For Vault-issued or operator-managed admin certificates, API trust and
+authorization, installation, renewal, CA overlap, recovery, and the existing
+revocation support boundary, see
+[NICo mTLS and authorization](./nico-api-auth.md).
 
 ---
 

@@ -1,283 +1,147 @@
 # NICo mTLS and authorization
 
-`nico-api` uses mutual TLS (mTLS) for all connections: the server presents a
-certificate the client verifies against a root CA, and the client presents a
-certificate the server verifies against a separate admin CA. Authorization is
-then handled by a Casbin RBAC policy that maps certificate fields to roles and
-gRPC method permissions.
+The admin CLI uses mTLS for administrative requests. Sites may retain their
+Vault-issued client certificates or use an operator-managed admin PKI; neither
+path requires JWT support in the CLI.
+
+## Keep the two trust directions separate
+
+- The CLI's `--root-ca-path` verifies **the API server**. Keep the site's server
+  CA here; an independent admin CA does not replace it.
+- The API's `[tls].root_cafile_path` and optional
+  `[tls].admin_root_cafile_path` form its combined **client** trust store.
+  Adding an admin CA does not replace the service or machine CA.
+- TLS trust is not sufficient for admin access. The certificate must also pass
+  Casbin authorization and the internal RBAC rules.
 
 ## Generating client certificates
 
-### Creating an admin CA and client cert with OpenSSL
+Use the site's existing Vault issuance procedure or ask the operator's PKI
+owner for a PEM client certificate chain and its matching unencrypted PEM
+private key (PKCS#1, PKCS#8, or SEC1).
+NICo does not require a particular external PKI product or issue these
+operator credentials automatically.
 
-The following creates a self-contained CA and client certificate. In
-production you would typically use your organization's existing PKI
-instead of a self-signed CA.
+For an independent admin PKI:
 
-```sh
-# 1. Generate the CA key and self-signed certificate
-openssl ecparam -name prime256v1 -genkey -noout -out admin-ca.key
-openssl req -x509 -new -key admin-ca.key -sha256 -days 3650 \
-  -out admin-ca.crt \
-  -subj "/O=ExampleCo/CN=ExampleCo NICo Admin CA"
+- Use a dedicated admin-client issuing intermediate whose entire issuance
+  population is intended to have admin access. Its Subject CN must be globally
+  unique across the API's combined trust store and encoded as an ASN.1
+  `PrintableString`; the client leaf's Issuer CN must match it.
+- The leaf must be valid for TLS client authentication, with the appropriate
+  `clientAuth` extended key usage and signing key usage. Include any
+  intermediates needed to build its chain to the configured trust anchor.
+- Include the operator's identity in Subject CN, encoded as `PrintableString`.
+  Some administrative operations require this identity, not just TLS trust.
+  Optional Subject O/OU values supply organization/group audit information
+  and must also use `PrintableString` to be parsed. Under the default internal
+  RBAC rules, the group label does not restrict an admin's permissions.
 
-# 2. Generate a client key
-openssl ecparam -name prime256v1 -genkey -noout -out client.key
+Protect private keys at their source and on the CLI host. Only public CA
+certificates belong in the API's trust ConfigMap; never install a CA private
+key there.
 
-# 3. Create a CSR with operator identity in the subject
-#    - O  = organization (matched by required_equals if configured)
-#    - OU = group (used for role-based authorization via group_from)
-#    - CN = username (used for audit logging via username_from)
-openssl req -new -key client.key -out client.csr \
-  -subj "/O=ExampleCo/OU=site-admins/CN=jdoe"
+## Configure API trust and authorization
 
-# 4. Create an extensions file for clientAuth
-cat > client_ext.cnf <<EOF
-basicConstraints = CA:FALSE
-keyUsage = digitalSignature, keyEncipherment
-extendedKeyUsage = clientAuth
-EOF
+For Helm deployments, follow the
+[admin-client certificate configuration](https://github.com/dsx-ai-factory/infra-controller/blob/main/helm/PREREQUISITES.md#admin-client-certificates):
 
-# 5. Sign the client certificate with the CA
-openssl x509 -req -in client.csr \
-  -CA admin-ca.crt -CAkey admin-ca.key -CAcreateserial \
-  -out client.crt -days 365 -sha256 \
-  -extfile client_ext.cnf
+1. Set `nico-api.siteConfig.adminRootCertPem` to the public PEM trust bundle.
+   Its default is empty; the optional bundle is materialized only when set,
+   and requires `nico-api.siteConfig.enabled=true`.
+2. Add the leaf's dedicated issuing-intermediate CN to
+   `nico-api.auth.additionalIssuerCns`. The chart default is an empty list.
+   Preserve every existing issuer CN that must continue to authenticate;
+   replacing this list is not an additive update.
+3. Apply those overrides through the site's Helm release workflow, preserving
+   its other values. Changes to these chart values roll the API Deployment,
+   loading both the trust bundle and issuer mapping.
 
-# 6. Clean up intermediate files
-rm -f client.csr client_ext.cnf admin-ca.srl
-```
+The default `nico-api.auth.adminRootCafilePath` selects
+`/etc/forge/carbide-api/site/admin_root_cert_pem`. The prerequisites document
+also covers the alternate mounted path and the PEM-envelope validation rules.
+Helm does not validate X.509 CA constraints, validity, or chain placement;
+the PKI owner must validate those before installation.
 
-This produces:
+The issuer mapping is `[auth.trust].additional_issuer_cns` in the API's TOML
+configuration. It classifies certificates as `ExternalUser` by issuer CN
+across the combined TLS trust store; it is **not** bound cryptographically to
+the optional admin bundle. Do not list a shared or root CA CN for the new
+admin issuer.
 
-| File | Purpose |
-|------|---------|
-| `admin-ca.crt` | Root CA -- configure as `admin_root_cafile_path` in nico-api |
-| `admin-ca.key` | CA private key -- keep offline/secured |
-| `client.crt` | Operator's client certificate |
-| `client.key` | Operator's client private key |
+Every successfully verified client certificate is also a
+`TrustedCertificate`. The default chart's Casbin `forge/*` rule accepts that
+principal, but internal RBAC still requires an `ExternalUser` for the
+`ForgeAdminCLI` access path. Keep `bypass_rbac=false` and
+`nico-api.auth.permissiveMode=false` in production. Permissive mode bypasses
+Casbin only, not internal RBAC.
 
-### Certificate subject fields and how they map to authorization
+The issuer-CN mapping takes precedence over custom `[auth.cli_certs]` criteria:
+matching certificates skip that section's field restrictions and identity
+extraction. If those criteria define the site's admin boundary, do not add
+the issuer to `additionalIssuerCns` in step 2. Retain or configure the custom
+criteria instead, and verify them with the site's Casbin and internal RBAC
+policies. Use the issuer shortcut only when its dedicated issuance population
+is intended to have admin access.
 
-The `[auth.cli_certs]` section in `nico-api-config.toml` controls how
-certificate fields are interpreted:
+## Install and verify the CLI credential
 
-| Config key | Purpose | Example |
-|------------|---------|---------|
-| `required_equals` | Issuer/subject fields that **must** match exactly for the cert to be accepted | `{ "IssuerO" = "ExampleCo", "IssuerCN" = "ExampleCo NICo Admin CA" }` |
-| `group_from` | Which cert field to extract the authorization group from | `"SubjectOU"` |
-| `username_from` | Which cert field to extract the username from (for audit trails) | `"SubjectCN"` |
-| `username` | Fixed username for all certs of this type (alternative to `username_from`) | `"shared-admin"` |
+Install the certificate chain and matching private key on the operator's CLI
+host using the site's protected-file or Secret-mount procedure. Supply both
+paths through the existing CLI inputs; no new authentication option is needed.
+The [CLI connection guide](./nico-admin-cli.md#tls-options) documents flags,
+environment variables, config-file keys, and fallback behavior.
 
-The available `CertComponent` values are:
-
-- `IssuerO`, `IssuerOU`, `IssuerCN` -- from the certificate issuer
-- `SubjectO`, `SubjectOU`, `SubjectCN` -- from the certificate subject
-
-## Server-side configuration (nico-api)
-
-### TLS section
-
-The `[tls]` section of `nico-api-config.toml` tells nico-api
-where to find its own server certificate and which CAs to trust for
-client authentication:
-
-```toml
-[tls]
-identity_pemfile_path = "/path/to/server.crt"
-identity_keyfile_path = "/path/to/server.key"
-root_cafile_path = "/path/to/internal-ca.crt"
-admin_root_cafile_path = "/path/to/admin-ca.crt"
-```
-
-| Key | Description |
-|-----|-------------|
-| `identity_pemfile_path` | Server's own TLS certificate (PEM) |
-| `identity_keyfile_path` | Server's private key (PEM) |
-| `root_cafile_path` | CA used to verify internal client certs |
-| `admin_root_cafile_path` | CA used to verify external admin client certs |
-
-nico-api loads both `root_cafile_path` and `admin_root_cafile_path`
-into its TLS trust store. A client presenting a certificate signed by
-either CA will pass the TLS handshake.
-
-### Configuring authorization
-
-Authorization is configured in the `[auth]` section of
-`nico-api-config.toml`.
-
-#### Casbin policy
-
-nico-api uses [Casbin](https://casbin.org/) with an RBAC model for
-authorization. The model is compiled into the binary and uses two rule
-types:
-
-- **`g` (grouping) rules** -- map a principal identifier to a role name
-- **`p` (policy) rules** -- allow a principal or role to call a gRPC
-  method (glob matching is supported on the method name)
-
-The policy file is a CSV referenced by `casbin_policy_file`:
-
-```toml
-[auth]
-permissive_mode = false
-casbin_policy_file = "/path/to/casbin-policy.csv"
-```
-
-##### How principals are identified
-
-| Certificate type | Principal identifier format | Example |
-|-----------------|---------------------------|---------|
-| External admin cert | `external-role/<group>` | `external-role/site-admins` |
-| Any trusted cert | `trusted-certificate` | |
-| No cert | `anonymous` | |
-
-The `<group>` in `external-role/<group>` comes from the certificate
-field specified by `group_from` in `[auth.cli_certs]`.
-
-##### Writing policy rules
-
-Sample policy file:
-
-```csv
-# On `g` rules: These associate a principal (second column) with a role name
-# (third column). This causes the named role to also be looked up as if it were
-# a principal.
-#
-# On `p` rules: These allow a principal or role (second column) to perform the
-# named action (third column). Glob matching is available on the action field.
-#
-
-
-# Map the nico-dhcp SPIFFE ID to the nico-dhcp role.
-# FIXME: verify that this is how these SPIFFE service identifiers look in reality.
-g, spiffe-service-id/nico-dhcp, nico-dhcp
-g, spiffe-service-id/nico-dns, nico-dns
-g, spiffe-machine-id, machine
-
-# Allow the nico-dhcp role to call its methods.
-p, nico-dhcp, nico/DiscoverDhcp
-
-# Same idea for nico-dns.
-p, nico-dns, nico/LookupRecord
-
-# Anonymous access to endpoints that don't modify state or expose any customer
-# or site data should be fine.
-p, anonymous, nico/Version
-
-# Allow anonymous access to methods used by machines that may not have their
-# certificates from us yet.
-p, anonymous, nico/DiscoverMachine
-p, anonymous, nico/ReportNicoScoutError
-p, anonymous, nico/AttestQuote
-
-# Allow anonymous access to methods used by dpu-agent. As of 2023-09-28 there
-# are probably a fair amount of agents across the environments that don't have a
-# certificate and are not ready for strict enforcement.
-p, anonymous, nico/FindInstanceByMachineID
-p, anonymous, nico/GetManagedHostNetworkConfig
-p, anonymous, nico/RecordDpuNetworkStatus
-
-# The client cert generated above has OU=site-admins in its subject.
-# With group_from = "SubjectOU" in [auth.cli_certs], that becomes the
-# principal "external-role/site-admins". Map it to a role and grant access.
-g, external-role/site-admins, site-admin
-p, site-admin, nico/*
-
-# Example of a restricted role: a cert with OU=viewers would only get
-# read access to a handful of methods.
-g, external-role/viewers, viewer
-p, viewer, nico/Version
-p, viewer, nico/GetMachine
-p, viewer, nico/ListMachines
-p, viewer, nico/GetInstance
-p, viewer, nico/ListInstances
-
-
-# Allow any certificate we trust to hit any NICo method.
-# FIXME: This should be removed once we have more fine-grained rule coverage.
-p, trusted-certificate, nico/*
-```
-
-The method names in the `nico/<Method>` column correspond to the gRPC
-method names defined in the protobuf service definitions. Glob matching
-(`*`) is supported.
-
-##### Full example: nico-api config with external admin certs
-
-```toml
-[tls]
-identity_pemfile_path = "/path/to/server.crt"
-identity_keyfile_path = "/path/to/server.key"
-root_cafile_path = "/path/to/internal-ca.crt"
-admin_root_cafile_path = "/path/to/admin-ca.crt"
-
-[auth]
-permissive_mode = false
-casbin_policy_file = "/path/to/casbin-policy.csv"
-
-[auth.cli_certs]
-required_equals = { "IssuerO" = "ExampleCo", "IssuerCN" = "ExampleCo NICo Admin CA" }
-group_from = "SubjectOU"
-username_from = "SubjectCN"
-
-[auth.trust]
-spiffe_trust_domain = "nico.local"
-spiffe_service_base_paths = [
-  "/nico-system/sa/",
-  "/default/sa/",
-  "/elektra-site-agent/sa/",
-]
-spiffe_machine_base_path = "/nico-system/machine/"
-additional_issuer_cns = []
-```
-
-With this configuration, a client certificate with subject
-`/O=ExampleCo/OU=site-admins/CN=jdoe` and issuer
-`/O=ExampleCo/CN=ExampleCo NICo Admin CA` would:
-
-1. Pass the `required_equals` check (IssuerO and IssuerCN match)
-2. Be assigned group `site-admins` (from SubjectOU)
-3. Be identified as user `jdoe` (from SubjectCN)
-4. Receive the principal `external-role/site-admins`
-5. Be authorized according to whatever casbin policy rules match that
-   principal
-
-You can see an example of a complete nico-api configuration file in [full_config.toml](https://github.com/dsx-ai-factory/infra-controller/blob/main/crates/api-core/src/cfg/test_data/full_config.toml)
-
-### Permissive mode
-
-Setting `permissive_mode = true` in the `[auth]` section causes the
-authorization engine to **allow all requests**, even when the casbin
-policy would deny them. Denied requests are logged with a warning
-instead of being rejected:
-
-```toml
-[auth]
-permissive_mode = true
-```
-
-When permissive mode is active, nico-api logs messages like:
-
-```text
-WARN The policy engine denied this request, but --auth-permissive-mode overrides it.
-```
-
-**Use permissive mode only for:**
-
-- Initial deployment and bring-up, before certificates are fully
-  configured
-- Debugging authorization issues (enable temporarily, check logs, then
-  disable)
-- Development environments
-
-**Do not leave permissive mode enabled in production.** It bypasses all
-authorization checks. Any client that can complete the TLS handshake
-(or any client at all, if TLS is also disabled) can call any API method.
-
-You can also set permissive mode via environment variable without
-editing the config file:
+Verify a protected, read-only operation:
 
 ```sh
-NICO_API_AUTH="{permissive_mode=true}"
+nico-admin-cli \
+  --api-url https://nico-api.example.com:1079 \
+  --root-ca-path /etc/nico/certs/server-ca.crt \
+  --client-cert-path /etc/nico/certs/admin-client.crt \
+  --client-key-path /etc/nico/certs/admin-client.key \
+  machine show
 ```
+
+Replace the URL and paths with the site's values. Connection options precede
+the subcommand. Leave `DISABLE_TLS_ENFORCEMENT` unset; setting it, even to an
+empty value, disables server-certificate verification. With that override
+unset, a successful query verifies server trust, client authentication, and
+permission to read machines; an empty inventory is also a valid result.
+`version` is only a connectivity check: it neither verifies the server
+certificate nor sends a client certificate, and the API allows it anonymously.
+
+Before relying on the new issuer, confirm that the existing Vault-issued
+credential still works and that a certificate from an untrusted issuer is
+rejected. A trusted certificate without an admin identity must not gain admin
+access under the site's policy.
+
+## Renewal, CA overlap, and recovery
+
+The operator's PKI owns issuance and renewal. Before a leaf expires, obtain its
+replacement, install the new chain/key together, and repeat the protected
+query. If the files are lost or installation fails, repeat issuance and
+installation; restore the site's configuration or trust bundle if that was
+the cause. NICo does not automatically renew a CLI host's credential.
+
+Changing the issuing CA is optional. Stage the new public trust anchor
+alongside the old one and retain both issuer CN mappings, then apply the Helm
+values. Verify old and new credentials, move operators to the new credentials,
+and only then remove the retired admin anchor and mapping. Do not remove the
+site's service/machine CA as part of an admin-only change. Verify the retired
+credential is denied after the rollout; custom authorization mappings must
+also stop granting it access.
+
+## Revocation support boundary
+
+This procedure preserves the existing CLI mTLS support level. The API listener
+does not configure CRL or OCSP enforcement for client certificates; revoking a
+leaf at the issuer alone does not cause the API to reject it. A leaf's
+expiry or retiring its admin issuer's trust/authorization is the existing
+containment mechanism, not a new per-certificate revocation feature.
+
+For issuer retirement, remove its admin trust anchor and every mapping that
+grants it admin access, apply the configuration, and verify rejection with the
+old credential on a new connection. A trust-file refresh does not revalidate
+already-established connections; completing the API rollout closes the old
+connections. Issuer retirement affects all credentials from that issuer.
