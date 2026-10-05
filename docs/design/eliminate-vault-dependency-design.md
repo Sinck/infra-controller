@@ -32,6 +32,7 @@ and operator contracts remain authoritative for their implementation:
 - [DPU bootstrap CA trust](../dpu-management/dpu_configuration.md#bootstrap-ca-trust)
 - [NVSwitch mTLS certificates](../../helm/README.md#nvswitch-mtls-certificates)
 - [Admin client certificates](../../helm/PREREQUISITES.md#admin-client-certificates)
+- [Admin-client mTLS lifecycle and authorization](https://github.com/dsx-ai-factory/infra-controller/blob/main/docs/manuals/nico-api-auth.md)
 - [Certificate-provider separation implementation](https://github.com/dsx-ai-factory/infra-controller/pull/2881)
 
 The three phases are tracking boundaries, not a requirement to implement each
@@ -245,6 +246,10 @@ retired, then remove the legacy classifier. The CLI does not require JWT
 support. The existing
 [admin client certificate contract](../../helm/PREREQUISITES.md#admin-client-certificates)
 defines the configuration and its trust-boundary constraints.
+Issuance, installation, renewal, recovery, and the existing revocation support
+boundary are covered by the
+[admin-client mTLS guide](https://github.com/dsx-ai-factory/infra-controller/blob/main/docs/manuals/nico-api-auth.md), completed in
+[#7057](https://github.com/dsx-ai-factory/infra-controller/pull/7057).
 
 ### 3.3 Phase 3: Configurable Key and Certificate Services
 
@@ -606,44 +611,42 @@ The overall effort is complete when a supported site can:
 
 ## 7. Open Questions
 
-1. Which operator-managed PKI issues the admin CLI certificate, and what
-   renewal, revocation, and recovery procedure is required for it? The API and
-   CLI retain their existing mTLS mechanism; this operational decision is
-   tracked by [#5955](https://github.com/dsx-ai-factory/infra-controller/issues/5955).
-2. Which KMIP server products and exact protocol and cryptographic profiles are
+1. Which KMIP server products and exact protocol and cryptographic profiles are
    qualified first, and what are the minimum supported high-availability,
    backup, and recovery configurations? This decision is tracked by
    [#3253](https://github.com/dsx-ai-factory/infra-controller/issues/3253).
-3. How does API validation enforce individual node signing-credential
+2. How does API validation enforce individual node signing-credential
    disablement or revocation before certificate expiry without a CA-wide
    rotation? The same-CA cert-manager provider and new Rust
    Kubernetes-resource abstraction are selected; request naming, cleanup, and
    retry mechanics remain implementation details. The validation decision is
    tracked by
    [#5956](https://github.com/dsx-ai-factory/infra-controller/issues/5956).
-4. Does `dsx-exchange-consumer` require live credential reload, or is rotation
+3. Does `dsx-exchange-consumer` require live credential reload, or is rotation
    by restart sufficient? This decision is tracked by
    [#5957](https://github.com/dsx-ai-factory/infra-controller/issues/5957).
-5. What configuration selects each credential, KMS, and PKI provider, and what
+4. What configuration selects each credential, KMS, and PKI provider, and what
    invalid or conflicting combinations fail startup? What upgrade and rollback
    window remains supported? This
    decision is tracked by
    [#5958](https://github.com/dsx-ai-factory/infra-controller/issues/5958).
-6. Which DPF release and API safely consume per-device credential updates,
+5. Which DPF release and API safely consume per-device credential updates,
    and how does NICo verify that DPF uses the updated credential before
    allowing dependent operations? This decision is tracked by
    [#6147](https://github.com/dsx-ai-factory/infra-controller/issues/6147).
 
 ## 8. Implementation Status
 
-This section is a status snapshot dated 2026-09-28. Sections 1 through 7 define
+This section is a status snapshot dated 2026-10-05. Sections 1 through 7 define
 the end-state design and remain independent of implementation order. Phase 1
 ([#195](https://github.com/dsx-ai-factory/infra-controller/issues/195)) implementation
 is complete; this document
 ([#3251](https://github.com/dsx-ai-factory/infra-controller/issues/3251)) remains
-open. Remaining Phase 2 and Phase 3 work is tracked under
-[#5199](https://github.com/dsx-ai-factory/infra-controller/issues/5199) and
-[#5200](https://github.com/dsx-ai-factory/infra-controller/issues/5200). The tables
+open. The Phase 2 epic
+([#5199](https://github.com/dsx-ai-factory/infra-controller/issues/5199)) is closed;
+remaining certificate-provider work is tracked by
+[#5956](https://github.com/dsx-ai-factory/infra-controller/issues/5956) under Phase 3
+([#5200](https://github.com/dsx-ai-factory/infra-controller/issues/5200)). The tables
 below record the intentional intermediate states created when one epic lands
 before a dependency owned by another epic.
 
@@ -656,7 +659,7 @@ before a dependency owned by another epic.
 | Legacy Flow upgrade and cleanup | The current chart is Flow-only, but a site still running the predecessor three-container deployment cannot resume setup until an operator upgrades Flow. Its legacy Vault resources remain until setup resumes. | The Flow-only chart, fail-closed guard, and cleanup landed in the [Flow-only deployment implementation](https://github.com/dsx-ai-factory/infra-controller/pull/5325), tracked by [#5324](https://github.com/dsx-ai-factory/infra-controller/issues/5324). After the operator completes and verifies the supported Flow upgrade, setup removes the stranded security resources while Vault is still available. |
 | DPF BMC credential delivery | [#6487](https://github.com/dsx-ai-factory/infra-controller/pull/6487) removed the Vault-issued temporary admin credential, in-cluster CLI job, and two-stage rollout. The BMC version-0 source selector and watched Secret are shipped, but the target-wide `bmc-shared-password` projection cannot represent a fleet on mixed credential versions. | [#6147](https://github.com/dsx-ai-factory/infra-controller/issues/6147) qualifies supporting DPF behavior and integrates per-DPU Secrets with the existing per-BMC credential records and rotation mechanism. |
 | Initial phase 2 JWT boundary | [#355](https://github.com/dsx-ai-factory/infra-controller/issues/355) provides bearer JWTs and permits machine mTLS to be disabled at the transport-authentication layer, but the JWT is still signed with the Vault-issued mTLS certificate key and carries that certificate chain. The validator does not enforce individual certificate revocation, so certificate expiry or CA-wide rotation is the containment path for a compromised key. | [#5956](https://github.com/dsx-ai-factory/infra-controller/issues/5956) adds selectable cert-manager issuance and renewal using the same CA, without replacing the current certificate or key when the provider is selected, and adds API-side individual disablement or revocation enforcement. Sites may retain Vault PKI. |
-| Phase 2 agent boundary versus CLI | Scout and DPU-agent can use JWT while the admin CLI continues to use mTLS. The CLI may keep its Vault-issued credential or use a certificate from an operator-managed external admin CA through the existing trust and CLI inputs. | [#5955](https://github.com/dsx-ai-factory/infra-controller/issues/5955) documents and validates issuance, renewal, revocation, and recovery for the independent admin credential. |
+| Phase 2 agent boundary versus CLI | Scout and DPU-agent can use JWT while the admin CLI continues to use mTLS. The CLI may keep its Vault-issued credential or use a certificate from an operator-managed external admin CA through the existing trust and CLI inputs. | Completed by [#7057](https://github.com/dsx-ai-factory/infra-controller/pull/7057), closing [#5955](https://github.com/dsx-ai-factory/infra-controller/issues/5955). The [admin-client mTLS guide](https://github.com/dsx-ai-factory/infra-controller/blob/main/docs/manuals/nico-api-auth.md) covers the credential lifecycle and existing revocation support boundary. |
 | Certificate-provider separation boundary | [#2880](https://github.com/dsx-ai-factory/infra-controller/issues/2880) separates certificate vending from credential storage, but the production certificate-provider implementations remain Vault-backed. | [#5956](https://github.com/dsx-ai-factory/infra-controller/issues/5956) adds cert-manager as a selectable provider for node, UFM, service-transport, and optional NVSwitch issuance and retains the already-direct optional DPU OTLP gateway issuer. Reference sites use the same `site-root` CA and key on both paths, so selection preserves existing trust, certificates, keys, Secrets, and mounts. A custom site whose CA or key does not match remains on Vault PKI. |
 | Production KMS before encryption convergence | After [#3253](https://github.com/dsx-ai-factory/infra-controller/issues/3253), the PostgreSQL envelope and the machine-identity encryption-key credential can both use either Transit or a qualified KMIP server, but machine-identity signing keys still use a separate encryption primitive. | [#3255](https://github.com/dsx-ai-factory/infra-controller/issues/3255) converges machine-identity encryption on the shared KMS envelope without requiring a change of KMS provider. |
 
@@ -676,7 +679,7 @@ and [Credential Sources](../configuration/credential-sources.md#site-wide-bmc-ro
 | NVSwitch OS credentials | Closed as not planned: NSM is deprecated in favor of RMS, which reads switch credentials from NICo | [#1852](https://github.com/dsx-ai-factory/infra-controller/issues/1852) |
 | Node bearer JWT and dual-auth rollout | Implemented, with the Vault-issued mTLS certificate key as the intermediate signing credential | [#355](https://github.com/dsx-ai-factory/infra-controller/issues/355), [Node-auth bearer JWTs](machine-identity/node-auth-jwt.md) |
 | IRoT identity and API-issued refresh | Never merged; closed as not planned because the DPU OS cannot access the IRoT key and so cannot prove possession; the merged JWT path instead re-mints locally with the node certificate key | [#2917](https://github.com/dsx-ai-factory/infra-controller/issues/2917), [#3254](https://github.com/dsx-ai-factory/infra-controller/issues/3254) |
-| Admin CLI authentication | Existing Vault-issued mTLS remains supported; the independent operator-managed mTLS certificate lifecycle is open; DPF bootstrap no longer depends on the CLI | [#5955](https://github.com/dsx-ai-factory/infra-controller/issues/5955) |
+| Admin CLI authentication | Completed and documented; Vault-issued and independently issued admin mTLS credentials remain supported; DPF bootstrap no longer depends on the CLI | [#5955](https://github.com/dsx-ai-factory/infra-controller/issues/5955), [#7057](https://github.com/dsx-ai-factory/infra-controller/pull/7057) |
 | Per-DPU BMC credentials | Blocked on supporting DPF behavior; integration reuses existing per-BMC credentials and rotation with per-DPU Secret delivery, reconciliation, and safe credential updates | [#6147](https://github.com/dsx-ai-factory/infra-controller/issues/6147) |
 | Certificate-provider separation | Implemented; production providers remain Vault-backed | [#2880](https://github.com/dsx-ai-factory/infra-controller/issues/2880), [implementation](https://github.com/dsx-ai-factory/infra-controller/pull/2881) |
 | Selectable cert-manager certificate provider | Open; Vault PKI remains supported, and cert-manager with the same `site-root` CA and signing key is the independent option. A new Rust Kubernetes-resource abstraction uses in-memory keys and CSR-only `CertificateRequest` resources for dynamic node and UFM issuance; existing trust, leaves, keys, Secrets, and mounts remain unchanged. Issuance policy and API-side enforcement of individual node-signing credential disablement or revocation remain required. | [#5956](https://github.com/dsx-ai-factory/infra-controller/issues/5956) |
