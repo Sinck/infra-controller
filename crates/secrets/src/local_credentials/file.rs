@@ -214,6 +214,15 @@ impl FileCredentialsWatcher {
                 "credentials.file.poll_interval must be greater than zero"
             )));
         }
+        // Fail on a missing file before arming any watcher. `PollWatcher::watch`
+        // registers nothing for a missing path yet returns `Ok`, and the kernel
+        // watch failure for it would otherwise read as an inotify shortage.
+        tokio::fs::metadata(&path).await.map_err(|err| {
+            SecretsError::GenericError(eyre::Report::new(err).wrap_err(format!(
+                "credentials file {} is not accessible",
+                path.display()
+            )))
+        })?;
         let (tx, mut rx) = mpsc::channel(4);
 
         let primary = start_primary(&path, tx.clone());
@@ -603,10 +612,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_file_returns_error() {
-        // The poll watcher reports the missing path, so hold the metrics
-        // window to keep that count out of the metric-asserting tests.
-        let _metrics = MetricsCapture::start();
+    async fn missing_file_fails_startup_without_watcher_diagnostics() {
+        let metrics = MetricsCapture::start();
         let dir = tempdir().expect("create temp dir");
         let file_path = dir.path().join("does-not-exist.yaml");
         let result = FileCredentialsWatcher::new(FileCredentialsConfig {
@@ -614,7 +621,12 @@ mod tests {
             ..Default::default()
         })
         .await;
-        assert!(result.is_err());
+        assert!(result.is_err(), "a missing file must fail startup");
+        assert_eq!(
+            watcher_failure_delta(&metrics),
+            0.0,
+            "a missing file is a startup error, not a watcher failure"
+        );
     }
 
     #[tokio::test]
