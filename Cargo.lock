@@ -1678,6 +1678,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "carbide-client-cache"
+version = "0.0.0"
+dependencies = [
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "carbide-credential-rotation"
 version = "0.0.0"
 dependencies = [
@@ -2293,6 +2301,7 @@ dependencies = [
  "base64",
  "carbide-api-db",
  "carbide-api-model",
+ "carbide-client-cache",
  "carbide-health-report",
  "carbide-ib-fabric",
  "carbide-instrument",
@@ -6924,6 +6933,7 @@ name = "libnmxc"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "carbide-client-cache",
  "carbide-test-support",
  "clap",
  "http",
