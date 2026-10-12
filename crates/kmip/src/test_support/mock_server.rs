@@ -318,6 +318,10 @@ impl MockKmipServer {
 }
 
 async fn accept_loop(listener: TcpListener, acceptor: TlsAcceptor, state: Arc<ServerState>) {
+    // Connection tasks live in a set owned by this task, so aborting the
+    // accept task (which `MockKmipServer::drop` does) aborts every connection
+    // instead of leaving detached tasks holding sockets and server state.
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         let Ok((tcp, _peer)) = listener.accept().await else {
             return;
@@ -325,7 +329,7 @@ async fn accept_loop(listener: TcpListener, acceptor: TlsAcceptor, state: Arc<Se
         state.stats.connections.fetch_add(1, Ordering::SeqCst);
         let acceptor = acceptor.clone();
         let state = state.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let Ok(mut tls) = acceptor.accept(tcp).await else {
                 return;
             };
@@ -546,7 +550,10 @@ impl ServerState {
                     Some(iv) => iv.0,
                     None if parameters.random_iv == Some(RandomIv(true)) => {
                         let iv_len = self.behavior.iv_len.unwrap_or(requested_iv_len);
-                        rand::random::<[u8; 16]>()[..iv_len].to_vec()
+                        rand::random::<[u8; 16]>()
+                            .get(..iv_len)
+                            .map(<[u8]>::to_vec)
+                            .unwrap_or_default()
                     }
                     None => {
                         return failure(
@@ -556,6 +563,16 @@ impl ServerState {
                         );
                     }
                 };
+                // Whatever produced the IV, the cipher helper handles only
+                // these two sizes; refuse rather than panic with the key
+                // store locked.
+                if !matches!(iv.len(), 12 | 16) {
+                    return failure(
+                        Some(operation),
+                        ResultReason::InvalidField,
+                        "IV must be 96 or 128 bits",
+                    );
+                }
                 let sealed = seal(&key.material, &iv, &payload.data.0);
                 let (ciphertext, tag) = sealed.split_at(sealed.len() - 16);
                 success(
@@ -593,6 +610,13 @@ impl ServerState {
                         "object is not active",
                     );
                 }
+                if key.usage_mask & USAGE_MASK_DECRYPT == 0 {
+                    return failure(
+                        Some(operation),
+                        ResultReason::PermissionDenied,
+                        "usage mask does not permit decrypt",
+                    );
+                }
                 let (Some(iv), Some(tag)) = (
                     payload.iv_counter_nonce,
                     payload.authenticated_encryption_tag,
@@ -603,6 +627,13 @@ impl ServerState {
                         "an IV and an authentication tag are required",
                     );
                 };
+                if !matches!(iv.0.len(), 12 | 16) {
+                    return failure(
+                        Some(operation),
+                        ResultReason::InvalidField,
+                        "IV must be 96 or 128 bits",
+                    );
+                }
                 let mut sealed = payload.data.0.clone();
                 sealed.extend_from_slice(&tag.0);
                 match open(&key.material, &iv.0, &sealed) {
