@@ -130,7 +130,14 @@ The watcher reloads the file on filesystem events and on every `poll_interval`, 
 
 The filesystem events come from a kernel inotify watch that `nico-api` arms at startup. The kernel caps inotify instances per user across the whole node with the `fs.inotify.max_user_instances` sysctl. The kernel default is 128, and `nico-api` shares that budget with every other process on the node that runs as the same user; the `nico-api` chart sets no user, so by default that is root, alongside the kubelet and the container runtime. When the watch cannot be armed, `nico-api` logs `primary static credential watcher unavailable; relying on polling` at `WARN`, with the operating-system error in the `error` field and the poll interval in `poll_interval_secs`, increments `carbide_static_credential_watcher_failures_total{operation="primary_watch_setup"}`, and starts normally. A change is then picked up at the next rescan, so it takes up to `poll_interval` to apply, plus the reload itself. NICo does not need the watch to function.
 
-The logged error points at the exhausted resource. `OS file watch limit reached` is the per-user watch limit, `fs.inotify.max_user_watches`. `Too many open files` is either the per-user instance limit or the process's own open-file limit. Before startup, the `nico-api` chart sets the process's soft open-file limit to `fileDescriptorLimit`, 65536 by default. When the runtime's hard limit is lower, the chart clamps to it and logs `fileDescriptorLimit <requested> exceeds the hard limit <hard>; clamping`, so check the startup log and the effective limit first. When the process limit is intact, raise `fs.inotify.max_user_instances` on the node, for example to 8192. Event-driven reloads return at the next `nico-api` restart.
+The logged error points at the exhausted resource. `OS file watch limit reached` is the per-user watch limit, `fs.inotify.max_user_watches`. `Too many open files` is either the per-user instance limit or the process's own open-file limit. Before startup, the `nico-api` chart sets the process's soft open-file limit to `fileDescriptorLimit`, 65536 by default. When the runtime's hard limit is lower, the chart clamps to it and logs `fileDescriptorLimit <requested> exceeds the hard limit <hard>; clamping`, so check the startup log and the effective limit first. When the process limit is intact, raise `fs.inotify.max_user_instances` on the node, for example to 8192. Persist the value so it survives a reboot, in a file under `/etc/sysctl.d/` or through the tool that provisions the node, and apply it without rebooting:
+
+```bash
+echo 'fs.inotify.max_user_instances = 8192' | sudo tee /etc/sysctl.d/99-nico-inotify.conf
+sudo sysctl --system
+```
+
+The watch is armed only at startup, so event-driven reloads return at the next `nico-api` restart.
 
 The file may contain only `bmc_site_wide_root`. This unversioned entry supplies
 version 0 of the site-wide BMC root. Set `bmc_site_wide_root_source = "local"`
