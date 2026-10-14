@@ -329,6 +329,10 @@ creates the machine, NICo copies that ID to the machine, so BOM validation verif
 during ingestion instead of searching the existing SKUs for a match. The value is the SKU ID that `sku create --id`
 and `sku assign` use; follow the [SKU Names](#sku-names) convention.
 
+The rest of this section assumes that BOM validation is enabled (`enabled = true` under `[bom_validation]`; see
+[Configuration](#configuration)). When it is disabled, NICo still copies the ID to the machine but skips validation,
+so the host neither enters `SkuMissing` nor triggers automatic SKU generation.
+
 Set the ID with `em add --sku-id` when you create the entry, or change an existing entry in place:
 
 ```sh
