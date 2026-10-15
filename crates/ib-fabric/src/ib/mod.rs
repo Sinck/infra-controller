@@ -615,8 +615,15 @@ mod tests {
                 let dir = cert_material_dir();
                 let manager = cert_manager(&dir);
 
-                let before = manager.new_client("f1").await.map_err(drop)?;
-                let reused = Arc::ptr_eq(&before, &manager.new_client("f1").await.map_err(drop)?);
+                let before = manager
+                    .new_client("f1")
+                    .await
+                    .map_err(|error| format!("first build: {error}"))?;
+                let again = manager
+                    .new_client("f1")
+                    .await
+                    .map_err(|error| format!("reuse: {error}"))?;
+                let reused = Arc::ptr_eq(&before, &again);
 
                 // Give the file a modification time strictly after the cached
                 // client's creation. An explicit future timestamp avoids
@@ -628,8 +635,12 @@ mod tests {
                     .set_modified(SystemTime::now() + std::time::Duration::from_secs(60))
                     .expect("set TLS material mtime");
 
-                let rebuilt = !Arc::ptr_eq(&before, &manager.new_client("f1").await.map_err(drop)?);
-                Ok::<_, ()>((reused, rebuilt))
+                let after = manager
+                    .new_client("f1")
+                    .await
+                    .map_err(|error| format!("rebuild: {error}"))?;
+                let rebuilt = !Arc::ptr_eq(&before, &after);
+                Ok::<_, String>((reused, rebuilt))
             },
         )
         .await;

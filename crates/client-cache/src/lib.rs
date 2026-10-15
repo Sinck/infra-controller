@@ -97,8 +97,8 @@ impl<K, F, C> ClientCache<K, F, C> {
         }
     }
 
-    /// Locks the entries. Each critical section is a single lookup, removal,
-    /// or insertion that leaves the map consistent if it panics, so a poisoned
+    /// Locks the entries. Each critical section is a single lookup or
+    /// insertion that leaves the map consistent if it panics, so a poisoned
     /// lock is recovered instead of failing every later caller.
     fn lock(&self) -> MutexGuard<'_, HashMap<K, Entry<F, C>>> {
         self.entries.lock().unwrap_or_else(PoisonError::into_inner)
