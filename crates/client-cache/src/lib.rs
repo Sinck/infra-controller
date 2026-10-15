@@ -25,10 +25,12 @@
 //!
 //! - It reuses a cached client while the caller's fingerprint of its by-value
 //!   inputs, such as an endpoint and credentials, matches the one the client
-//!   was built from, and no TLS material file is newer than the client.
-//! - It evicts and rebuilds the client once the fingerprint differs or a TLS
-//!   material file was modified after the client was built (certificate
-//!   rotation).
+//!   was built from, and no TLS material file is newer than the client's
+//!   build.
+//! - It rebuilds the client once the fingerprint differs or a TLS material
+//!   file was modified after the client's build started (certificate
+//!   rotation), and replaces the cached client only when the rebuild
+//!   succeeds.
 //! - It keeps the cached client when a TLS material file's modification time
 //!   cannot be read, so a file missing during an incomplete rotation does not
 //!   tear down a working client.
@@ -77,8 +79,8 @@ pub enum TlsMaterialEvent<'a> {
         /// Why its modification time could not be read.
         error: &'a io::Error,
     },
-    /// The file was modified after the cached client was built, so the client
-    /// is evicted and rebuilt.
+    /// The file was modified after the cached client's build started, so the
+    /// client is rebuilt.
     Newer {
         /// The TLS material file that was checked.
         path: &'a Path,
@@ -109,22 +111,25 @@ impl<K: Eq + Hash, F: PartialEq, C: Clone> ClientCache<K, F, C> {
     ///
     /// A cached client is stale when it was built with a different
     /// `fingerprint`, or when a file in `tls_material`, the on-disk material
-    /// `build` loads, was modified after the client was built. Files are
+    /// `build` loads, was modified after the client's build started. Files are
     /// checked in order until one is newer. A file whose modification time
     /// cannot be read does not make the client stale. A future-dated
     /// modification time, such as from writer clock skew, makes every call
-    /// rebuild until the clock passes it. Unreadable files and the newer file
-    /// are reported to the handler passed to [`ClientCache::new`].
+    /// rebuild until the clock passes it. Unreadable files checked before the
+    /// first newer file, and that newer file, are reported to the handler
+    /// passed to [`ClientCache::new`].
     ///
-    /// A stale client is evicted before `build` runs, so when `build` fails,
-    /// its error is returned and nothing is cached under `key`. The creation
-    /// time is taken before `build` runs, so material rewritten while building
-    /// counts as newer than the new client and triggers one more rebuild
-    /// instead of being missed.
+    /// A stale client is never returned, but it stays cached until a rebuild
+    /// succeeds and replaces it. When `build` fails, its error is returned and
+    /// the previous client remains for a later call that finds it fresh again,
+    /// for example once a newer file is withdrawn. The creation time is taken
+    /// before `build` runs, so material rewritten while building counts as
+    /// newer than the new client and triggers one more rebuild instead of
+    /// being missed.
     ///
-    /// The cache lock is held only to look up, evict, and insert, never across
-    /// the modification-time reads or `build`. Concurrent calls that miss the
-    /// same key may each build; the last insert wins.
+    /// The cache lock is held only to look up and insert, never across the
+    /// modification-time reads or `build`. Concurrent calls that find the same
+    /// key stale may each build; the last insert wins.
     pub async fn get_or_build<Q, P, E, Fut>(
         &self,
         key: &Q,
@@ -149,7 +154,6 @@ impl<K: Eq + Hash, F: PartialEq, C: Clone> ClientCache<K, F, C> {
             return Ok(client);
         }
 
-        self.lock().remove(key);
         // Before building: the build reads the material that later calls
         // compare against this time.
         let created = SystemTime::now();
@@ -166,7 +170,8 @@ impl<K: Eq + Hash, F: PartialEq, C: Clone> ClientCache<K, F, C> {
     }
 
     /// True when a file in `tls_material` was modified after `created`.
-    /// Reports each unreadable file and the newer file.
+    /// Reports each unreadable file checked before the first newer file, and
+    /// that newer file.
     async fn tls_material_newer_than(
         &self,
         tls_material: &[impl AsRef<Path>],
@@ -204,9 +209,13 @@ impl<K, F, C> fmt::Debug for ClientCache<K, F, C> {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::convert::Infallible;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
+
+    use carbide_test_support::Outcome::Yields;
+    use carbide_test_support::{Case, check_cases_async};
 
     use super::*;
 
@@ -309,120 +318,147 @@ mod tests {
         events: Vec<(&'static str, &'static str)>,
     }
 
+    /// Rows that remove a listed file and still rebuild use a failing build,
+    /// because real builders load every listed file.
     #[tokio::test]
     async fn caches_clients_until_their_inputs_change() {
-        struct Row {
-            scenario: &'static str,
-            change: Change,
-            expect: Observed,
-        }
+        check_cases_async(
+            [
+                Case {
+                    scenario: "unchanged inputs reuse the cached client",
+                    input: Change::default(),
+                    expect: Yields(Observed {
+                        acquired: Ok(1),
+                        cached: Some(1),
+                        events: vec![],
+                    }),
+                },
+                Case {
+                    scenario: "a changed fingerprint rebuilds the client",
+                    input: Change {
+                        fingerprint_changed: true,
+                        ..Change::default()
+                    },
+                    expect: Yields(Observed {
+                        acquired: Ok(2),
+                        cached: Some(2),
+                        events: vec![],
+                    }),
+                },
+                Case {
+                    scenario: "a newer file after unchanged ones rebuilds the client",
+                    input: Change {
+                        rotated: Some("tls.key"),
+                        ..Change::default()
+                    },
+                    expect: Yields(Observed {
+                        acquired: Ok(2),
+                        cached: Some(2),
+                        events: vec![("newer", "tls.key")],
+                    }),
+                },
+                Case {
+                    scenario: "the first newer file ends the scan",
+                    input: Change {
+                        rotated: Some("ca.crt"),
+                        removed: Some("tls.key"),
+                        build_fails: true,
+                        ..Change::default()
+                    },
+                    expect: Yields(Observed {
+                        acquired: Err(BuildFailed),
+                        cached: Some(1),
+                        events: vec![("newer", "ca.crt")],
+                    }),
+                },
+                Case {
+                    scenario: "an unreadable file keeps the cached client",
+                    input: Change {
+                        removed: Some("ca.crt"),
+                        ..Change::default()
+                    },
+                    expect: Yields(Observed {
+                        acquired: Ok(1),
+                        cached: Some(1),
+                        events: vec![("unreadable", "ca.crt")],
+                    }),
+                },
+                Case {
+                    scenario: "an unreadable file does not hide a newer one",
+                    input: Change {
+                        removed: Some("ca.crt"),
+                        rotated: Some("tls.key"),
+                        build_fails: true,
+                        ..Change::default()
+                    },
+                    expect: Yields(Observed {
+                        acquired: Err(BuildFailed),
+                        cached: Some(1),
+                        events: vec![("unreadable", "ca.crt"), ("newer", "tls.key")],
+                    }),
+                },
+                Case {
+                    scenario: "a failed rebuild keeps the stale client cached but unserved",
+                    input: Change {
+                        fingerprint_changed: true,
+                        build_fails: true,
+                        ..Change::default()
+                    },
+                    expect: Yields(Observed {
+                        acquired: Err(BuildFailed),
+                        cached: Some(1),
+                        events: vec![],
+                    }),
+                },
+            ],
+            |change| async move {
+                let harness = Harness::new();
+                assert_eq!(harness.acquire(1, false).await, Ok(1), "first build");
+                if let Some(file) = change.removed {
+                    std::fs::remove_file(harness.path(file)).expect("remove TLS material");
+                }
+                if let Some(file) = change.rotated {
+                    // An explicit future timestamp avoids depending on the
+                    // filesystem's modification-time resolution.
+                    set_modified(
+                        &harness.path(file),
+                        SystemTime::now() + Duration::from_secs(60),
+                    );
+                }
 
-        let rows = [
-            Row {
-                scenario: "unchanged inputs reuse the cached client",
-                change: Change::default(),
-                expect: Observed {
-                    acquired: Ok(1),
-                    cached: Some(1),
-                    events: vec![],
-                },
+                let fingerprint = if change.fingerprint_changed { 2 } else { 1 };
+                let acquired = harness.acquire(fingerprint, change.build_fails).await;
+                Ok::<_, Infallible>(Observed {
+                    acquired,
+                    cached: harness.cached(),
+                    events: EVENTS.take(),
+                })
             },
-            Row {
-                scenario: "a changed fingerprint rebuilds the client",
-                change: Change {
-                    fingerprint_changed: true,
-                    ..Change::default()
-                },
-                expect: Observed {
-                    acquired: Ok(2),
-                    cached: Some(2),
-                    events: vec![],
-                },
-            },
-            Row {
-                scenario: "a newer file after unchanged ones rebuilds the client",
-                change: Change {
-                    rotated: Some("tls.key"),
-                    ..Change::default()
-                },
-                expect: Observed {
-                    acquired: Ok(2),
-                    cached: Some(2),
-                    events: vec![("newer", "tls.key")],
-                },
-            },
-            Row {
-                scenario: "an unreadable file keeps the cached client",
-                change: Change {
-                    removed: Some("ca.crt"),
-                    ..Change::default()
-                },
-                expect: Observed {
-                    acquired: Ok(1),
-                    cached: Some(1),
-                    events: vec![("unreadable", "ca.crt")],
-                },
-            },
-            Row {
-                scenario: "an unreadable file does not hide a newer one",
-                change: Change {
-                    removed: Some("ca.crt"),
-                    rotated: Some("tls.key"),
-                    ..Change::default()
-                },
-                expect: Observed {
-                    acquired: Ok(2),
-                    cached: Some(2),
-                    events: vec![("unreadable", "ca.crt"), ("newer", "tls.key")],
-                },
-            },
-            Row {
-                scenario: "a failed rebuild evicts the stale client",
-                change: Change {
-                    fingerprint_changed: true,
-                    build_fails: true,
-                    ..Change::default()
-                },
-                expect: Observed {
-                    acquired: Err(BuildFailed),
-                    cached: None,
-                    events: vec![],
-                },
-            },
-        ];
+        )
+        .await;
+    }
 
-        for Row {
-            scenario,
-            change,
-            expect,
-        } in rows
-        {
-            let harness = Harness::new();
-            assert_eq!(
-                harness.acquire(1, false).await,
-                Ok(1),
-                "{scenario}: first build"
-            );
-            if let Some(file) = change.removed {
-                std::fs::remove_file(harness.path(file)).expect("remove TLS material");
-            }
-            if let Some(file) = change.rotated {
-                // An explicit future timestamp avoids depending on the
-                // filesystem's modification-time resolution.
-                set_modified(
-                    &harness.path(file),
-                    SystemTime::now() + Duration::from_secs(60),
-                );
-            }
+    #[tokio::test]
+    async fn withdrawing_material_after_a_failed_rebuild_restores_the_working_client() {
+        let harness = Harness::new();
+        assert_eq!(harness.acquire(1, false).await, Ok(1));
 
-            let fingerprint = if change.fingerprint_changed { 2 } else { 1 };
-            let observed = Observed {
-                acquired: harness.acquire(fingerprint, change.build_fails).await,
-                cached: harness.cached(),
-                events: EVENTS.take(),
-            };
-            assert_eq!(observed, expect, "{scenario}");
-        }
+        set_modified(
+            &harness.path("tls.key"),
+            SystemTime::now() + Duration::from_secs(60),
+        );
+        assert_eq!(
+            harness.acquire(1, true).await,
+            Err(BuildFailed),
+            "the rotated key does not build"
+        );
+
+        std::fs::remove_file(harness.path("tls.key")).expect("remove TLS material");
+        assert_eq!(
+            harness.acquire(1, false).await,
+            Ok(1),
+            "the working client serves again once the bad key is withdrawn"
+        );
     }
 
     #[tokio::test]
@@ -447,6 +483,11 @@ mod tests {
             harness.acquire(1, false).await,
             Ok(1),
             "material rewritten while building triggers a rebuild"
+        );
+        assert_eq!(
+            harness.acquire(1, false).await,
+            Ok(1),
+            "the rebuilt client is reused because its build started after the rewrite"
         );
     }
 

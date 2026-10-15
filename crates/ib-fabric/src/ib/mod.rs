@@ -67,11 +67,12 @@ pub struct IBFabricManagerImpl {
 }
 
 /// Fingerprint of everything a REST client is built from by value: the
-/// resolved endpoint and the fabric's credentials. A changed endpoint (config
-/// reload) or changed credentials (secret rotation) produce a new fingerprint
-/// and therefore a rebuilt client. Certificate material selected by the
-/// credentials lives on disk rather than in them, so the client cache tracks
-/// its rotation separately by modification time.
+/// resolved endpoint and the fabric's credentials. Changed credentials (secret
+/// rotation) produce a new fingerprint and therefore a rebuilt client. A
+/// manager's endpoints are fixed for its lifetime, but the endpoint is hashed
+/// too so the fingerprint covers every by-value input. Certificate material
+/// selected by the credentials lives on disk rather than in them, so the
+/// client cache tracks its rotation separately by modification time.
 fn fabric_client_fingerprint(endpoint: &str, credentials: &Credentials) -> u64 {
     let mut hasher = DefaultHasher::new();
     endpoint.hash(&mut hasher);
@@ -189,12 +190,11 @@ impl IBFabricManager for IBFabricManagerImpl {
     /// monitor passes. (`Disable` and `Mock` hand out process-wide shared
     /// instances anyway.)
     ///
-    /// Concurrent misses for the same fabric may each build a client, last
-    /// insert wins -- a benign duplicate build that opens no connection, since
-    /// the client connects lazily on first use. The steady-state callers are
-    /// serial reconcile/monitor loops -- API handlers can also race in here,
-    /// at worst repeating that lazy build -- so per-fabric in-flight
-    /// serialization would be machinery without a workload.
+    /// Callers race here: partition state handlers run concurrently, alongside
+    /// the fabric monitor and API handlers. Concurrent misses for the same
+    /// fabric may each build a client, last insert wins -- a benign duplicate
+    /// build that opens no connection, since the client connects lazily on
+    /// first use -- so per-fabric in-flight serialization is not worth adding.
     async fn new_client(&self, fabric_name: &str) -> Result<Arc<dyn IBFabric>, IbError> {
         match self.config.manager_type {
             IBFabricManagerType::Disable => Ok(self.disable_fabric.clone()),
@@ -455,15 +455,16 @@ mod tests {
         }
     }
 
-    /// A `Rest` manager over two fabrics. Building a REST client makes no
-    /// connection (it connects lazily on first use), so these tests exercise
-    /// the real build + cache path without a UFM server.
+    /// A `Rest` manager over two fabrics that share one endpoint, so only the
+    /// fabric name tells their cache entries apart. Building a REST client
+    /// makes no connection (it connects lazily on first use), so these tests
+    /// exercise the real build + cache path without a UFM server.
     fn rest_manager(reader: Arc<dyn CredentialReader>) -> IBFabricManagerImpl {
         let config = IBFabricManagerConfig {
             manager_type: IBFabricManagerType::Rest,
             endpoints: HashMap::from([
                 ("f1".to_string(), vec!["https://127.0.0.1:443".to_string()]),
-                ("f2".to_string(), vec!["https://127.0.0.2:443".to_string()]),
+                ("f2".to_string(), vec!["https://127.0.0.1:443".to_string()]),
             ]),
             ..Default::default()
         };
@@ -531,6 +532,17 @@ mod tests {
         assert!(
             Arc::ptr_eq(&after, &after_again),
             "the rebuilt client replaces the cache entry"
+        );
+    }
+
+    #[test]
+    fn fingerprint_covers_the_endpoint() {
+        let credentials = SwappableCredentialReader::credentials("token-a");
+
+        assert_ne!(
+            fabric_client_fingerprint("https://127.0.0.1:443", &credentials),
+            fabric_client_fingerprint("https://127.0.0.2:443", &credentials),
+            "the same credentials at another endpoint need another client"
         );
     }
 

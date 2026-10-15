@@ -1681,6 +1681,7 @@ dependencies = [
 name = "carbide-client-cache"
 version = "0.0.0"
 dependencies = [
+ "carbide-test-support",
  "tempfile",
  "tokio",
 ]

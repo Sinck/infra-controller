@@ -123,8 +123,8 @@ pub struct NmxcTlsConfig {
 }
 
 impl NmxcTlsConfig {
-    /// The TLS material files a connect loads, which outdate a cached channel
-    /// once any of them is newer than it.
+    /// The configured TLS material files. A cached channel is rebuilt once any
+    /// of them is newer than it.
     fn material_paths(&self) -> Vec<PathBuf> {
         [
             &self.ca_cert_path,
@@ -216,7 +216,7 @@ struct TlsChannelConnector {
 #[derive(Clone, Debug)]
 pub struct NmxcClientPool {
     connector: Arc<dyn ChannelConnector>,
-    /// The TLS material files `connector` loads, watched for rotation.
+    /// The configured TLS material files, watched for rotation.
     tls_material: Vec<PathBuf>,
     /// Connected channels by endpoint URI, shared by all clones of a pool.
     channels: Arc<ClientCache<String, (), Channel>>,
@@ -248,9 +248,9 @@ impl NmxcClientPool {
     /// tonic channels multiplex requests and re-establish dropped connections
     /// lazily, so one channel per endpoint serves any number of clients across
     /// calls and monitor ticks, self-healing dropped connections along the way.
-    /// [`ClientCache::get_or_build`] rebuilds the channel once the TLS
-    /// material on disk changes (the same policy as the repo's gRPC clients),
-    /// so certificate rotations are picked up without a restart.
+    /// [`ClientCache::get_or_build`] rebuilds the channel once a configured
+    /// TLS material file on disk is newer than it, so certificate rotations
+    /// are picked up without a restart.
     ///
     /// Concurrent misses for the same URI may each connect, last insert wins --
     /// a benign duplicate handshake. The steady-state caller is a serial
@@ -635,8 +635,17 @@ mod tests {
                     client_key_path: Some(dir.path().join("client-key.pem")),
                     authority: None,
                 };
+                // Build through the public builder so its TLS material handoff
+                // is covered; only the connector is swapped for the counting
+                // fixture.
                 let connector = Arc::new(CountingConnector::default());
-                let pool = NmxcClientPool::with_connector(connector.clone(), tls.material_paths());
+                let pool = NmxcClientPool {
+                    connector: connector.clone(),
+                    ..NmxcClientPool::builder()
+                        .tls(tls)
+                        .build()
+                        .map_err(|error| error.to_string())?
+                };
                 let endpoint = Endpoint::new("http://127.0.0.1:50051").expect("endpoint");
 
                 pool.create_client(endpoint.clone())

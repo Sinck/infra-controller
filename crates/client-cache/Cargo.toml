@@ -27,6 +27,7 @@ repository.workspace = true
 tokio = { workspace = true }
 
 [dev-dependencies]
+carbide-test-support = { path = "../test-support" }
 tempfile = { workspace = true }
 
 [lints]
