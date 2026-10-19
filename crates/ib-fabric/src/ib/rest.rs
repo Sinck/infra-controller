@@ -42,8 +42,9 @@ const DEFAULT_MEMBERSHIP: PortMembership = PortMembership::Full;
 /// Detects the authentication method `auth` selects: a bearer token, or
 /// client-certificate files on disk. Certificate authentication is chosen for
 /// an empty `auth` string (the SPIFFE default paths) or one naming an existing
-/// path. The returned [`UFMCert`] paths are exactly what a client built from
-/// `auth` loads, so callers can also watch them for rotation.
+/// path. The returned [`UFMCert`] paths are exactly what [`new_client`] loads
+/// when given this result, so a caller resolves once, watches those paths for
+/// rotation, and builds from the same result.
 pub(super) fn auth_method(auth: &str) -> (Option<String>, Option<UFMCert>) {
     if auth.trim().is_empty() {
         (
@@ -68,9 +69,13 @@ pub(super) fn auth_method(auth: &str) -> (Option<String>, Option<UFMCert>) {
     }
 }
 
-pub(super) fn new_client(addr: &str, auth: &str) -> Result<Arc<dyn IBFabric>, IbError> {
-    let (token, cert) = auth_method(auth);
-
+/// Builds a client for the UFM at `addr` that authenticates with the `token`
+/// or `cert` that [`auth_method`] resolved.
+pub(super) fn new_client(
+    addr: &str,
+    token: Option<String>,
+    cert: Option<UFMCert>,
+) -> Result<Arc<dyn IBFabric>, IbError> {
     let conf = UFMConfig {
         address: addr.to_string(),
         username: None,
@@ -464,7 +469,12 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(listener, ufm_mock.router()).await.unwrap();
         });
-        let client = new_client(&format!("http://{address}"), "test-token").unwrap();
+        let client = new_client(
+            &format!("http://{address}"),
+            Some("test-token".to_string()),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(client.versions().await.unwrap().ufm_version, "6.18.0");
         assert_eq!(client.find_ib_port(None).await.unwrap().len(), 1);
