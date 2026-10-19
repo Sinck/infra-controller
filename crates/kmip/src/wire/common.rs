@@ -17,6 +17,8 @@
 //! Items shared by requests and responses: primitives, enumerations and the
 //! structures that appear on both sides.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize, Serializer};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -65,7 +67,9 @@ ttlv_newtype! {
     pub(crate) struct IvLength(i32) = "Transparent:0x4200CD";
 }
 ttlv_newtype! {
-    /// Tag Length in bytes, KMIP 1.4 section 3.6.
+    /// Tag Length, KMIP 1.4 section 3.6: the authentication tag length in
+    /// bytes, unlike IV Length, which is in bits. PyKMIP 0.11.0 reads it the
+    /// same way, passing the value straight to its cipher as a byte count.
     pub(crate) struct TagLength(i32) = "Transparent:0x4200CE";
 }
 ttlv_newtype! {
@@ -75,6 +79,12 @@ ttlv_newtype! {
 ttlv_newtype! {
     /// Server Correlation Value, KMIP 1.4 section 6.18.
     pub(crate) struct ServerCorrelationValue(String) = "Transparent:0x420106";
+}
+ttlv_newtype! {
+    /// Criticality Indicator of a Message Extension, KMIP 1.4 section 6.16:
+    /// when true, a recipient that does not understand the extension must
+    /// reject the message.
+    pub(crate) struct CriticalityIndicator(bool) = "Transparent:0x420026";
 }
 ttlv_bytes! {
     /// Unique Batch Item ID, KMIP 1.4 section 6.4.
@@ -105,19 +115,29 @@ ttlv_bytes! {
     pub(crate) struct NonceValue = "Transparent:0x4200CA";
 }
 ttlv_newtype! {
-    /// A tag in the extension range that no server sends. An `Option` of it is
-    /// the one field of a structure whose contents are to be skipped: the
-    /// deserializer announces unknown items only relative to a non-empty
-    /// field list, and fails on a structure with no fields at all.
+    /// A tag from the vendor-extension range that this crate assumes no server
+    /// uses. An `Option` of it is the one field of a structure whose contents
+    /// are to be skipped: the deserializer skips unknown items only relative
+    /// to a non-empty field list, and fails on a structure with no fields at
+    /// all. A server that did send this tag with an Integer value would have
+    /// it read and discarded; with another type, the response would not
+    /// decode.
     pub(crate) struct NeverPresent(i32) = "Transparent:0x54FFFF";
 }
 
 /// Data, KMIP 1.4 section 4.29: the plaintext or ciphertext of an Encrypt or
 /// Decrypt operation. Zeroized on drop because it carries the key material
-/// being wrapped or unwrapped.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// being wrapped or unwrapped, and `Debug` shows only the length so that no
+/// `{:?}` of a message can print it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename = "Transparent:0x4200C2")]
 pub(crate) struct Data(#[serde(with = "serde_bytes")] pub(crate) Vec<u8>);
+
+impl fmt::Debug for Data {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Data(<{} bytes>)", self.0.len())
+    }
+}
 
 impl Data {
     /// Moves the bytes into a zeroizing buffer without an intermediate copy.
@@ -505,4 +525,19 @@ pub(crate) struct Nonce {
 pub(crate) struct ServerInformation {
     #[serde(rename = "0x54FFFF", skip_serializing_if = "Option::is_none")]
     pub(crate) never_present: Option<NeverPresent>,
+}
+
+/// Message Extension, KMIP 1.4 section 6.16: a vendor extension appended to a
+/// batch item. Only the Vendor Identification and the Criticality Indicator
+/// are read; the Vendor Extension structure that follows is deliberately not
+/// a field, so the deserializer steps over it by its length whatever it
+/// contains, where decoding its items could fail on a type it does not
+/// support.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "0x420051")]
+pub(crate) struct MessageExtension {
+    #[serde(rename = "0x42009D")]
+    pub(crate) vendor_identification: VendorIdentification,
+    #[serde(rename = "0x420026")]
+    pub(crate) criticality_indicator: CriticalityIndicator,
 }

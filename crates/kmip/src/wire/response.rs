@@ -22,10 +22,10 @@ use serde::{Deserialize, Serialize};
 
 use super::common::{
     AsynchronousCorrelationValue, AttestationType, Attribute, AuthenticatedEncryptionTag,
-    BatchCount, ClientCorrelationValue, CorrelationValue, Data, IvCounterNonce, NeverPresent,
-    Nonce, ObjectType, Operation, ProtocolVersion, ResultMessage, ResultReason, ResultStatus,
-    ServerCorrelationValue, ServerInformation, TimeStamp, UniqueBatchItemId, UniqueIdentifier,
-    VendorIdentification,
+    BatchCount, ClientCorrelationValue, CorrelationValue, Data, IvCounterNonce, MessageExtension,
+    NeverPresent, Nonce, ObjectType, Operation, ProtocolVersion, ResultMessage, ResultReason,
+    ResultStatus, ServerCorrelationValue, ServerInformation, TimeStamp, UniqueBatchItemId,
+    UniqueIdentifier, VendorIdentification,
 };
 
 /// Response Message, KMIP 1.4 section 7.1.
@@ -61,7 +61,8 @@ pub(crate) struct ResponseHeader {
 }
 
 /// Response Batch Item, KMIP 1.4 section 7.2. A trailing Message Extension is
-/// skipped by the deserializer as an unknown item.
+/// decoded far enough to read its Criticality Indicator, so a critical one
+/// can be rejected instead of silently skipped.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename = "0x42000F")]
 pub(crate) struct ResponseBatchItem<P> {
@@ -79,6 +80,8 @@ pub(crate) struct ResponseBatchItem<P> {
     pub(crate) asynchronous_correlation_value: Option<AsynchronousCorrelationValue>,
     #[serde(rename = "0x42007C", skip_serializing_if = "Option::is_none")]
     pub(crate) payload: Option<P>,
+    #[serde(rename = "0x420051", skip_serializing_if = "Option::is_none")]
+    pub(crate) message_extension: Option<MessageExtension>,
 }
 
 /// Discover Versions response payload, KMIP 1.4 section 4.26.
@@ -104,7 +107,7 @@ pub(crate) struct QueryResponsePayload {
     pub(crate) server_information: Option<ServerInformation>,
 }
 
-/// Get Attributes response payload, KMIP 1.4 section 4.11.
+/// Get Attributes response payload, KMIP 1.4 section 4.12.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename = "0x42007C")]
 pub(crate) struct GetAttributesResponsePayload {

@@ -14,19 +14,26 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-//! Client behaviour against the mock server: connection reuse, refusal
-//! mapping, TLS failures, deadlines, the single retry, cancellation, and
-//! configuration validation at construction.
+//! Client behavior against the mock server: connection reuse and recycling,
+//! refusal mapping, the checks that tie a response to its request, TLS
+//! failures, deadlines, the single retry, cancellation, and configuration
+//! validation at construction.
 
-use std::time::Duration;
+use std::ops::Range;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use carbide_test_support::{Check, check_values};
 use tempfile::TempDir;
 
-use crate::test_support::{MockBehavior, MockKmipServer};
+use crate::test_support::{
+    EncryptFault, MockBehavior, MockKmipServer, ResponseFault, write_test_pki,
+};
 use crate::{
-    CryptographicAlgorithm, KeyAttributes, KmipClient, KmipClientConfig, KmipError, Operation,
-    ProtocolVersion, ResultReason, State, USAGE_MASK_DECRYPT, USAGE_MASK_ENCRYPT,
+    CryptographicAlgorithm, DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, KeyAttributes,
+    KmipClient, KmipClientConfig, KmipError, MAX_CONNECT_TIMEOUT, MAX_RESPONSE_BYTES, Operation,
+    ProtocolVersion, ResultReason, State, TimeoutPhase, USAGE_MASK_DECRYPT, USAGE_MASK_ENCRYPT,
 };
 
 const KEK: &str = "kek-1";
@@ -41,8 +48,36 @@ async fn server_and_client(behavior: MockBehavior) -> (MockKmipServer, TempDir, 
     (server, dir, client)
 }
 
-// Verifies the core contract: a 32-byte DEK wraps and unwraps through the
-// server, and consecutive calls share one connection.
+/// A server that holds the responses in `delayed` (counted from zero) for
+/// five seconds, far beyond the deadlines the tests configure, and answers
+/// every other request promptly.
+fn stalling(delayed: Range<usize>) -> MockBehavior {
+    MockBehavior {
+        response_delay: Some(Duration::from_secs(5)),
+        delayed_responses: Some(delayed),
+        ..MockBehavior::default()
+    }
+}
+
+/// Polls `condition` until it holds, failing after `deadline`.
+async fn wait_until(deadline: Duration, condition: impl Fn() -> bool) {
+    let started = Instant::now();
+    while !condition() {
+        assert!(
+            started.elapsed() < deadline,
+            "condition not met within {deadline:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn protocol_detail(error: &KmipError) -> &str {
+    match error {
+        KmipError::Protocol { detail, .. } => detail,
+        other => panic!("expected a protocol violation, got {other}"),
+    }
+}
+
 #[tokio::test]
 async fn wrap_and_unwrap_round_trip_on_one_connection() {
     let (server, _dir, client) = server_and_client(MockBehavior::default()).await;
@@ -66,9 +101,10 @@ async fn wrap_and_unwrap_round_trip_on_one_connection() {
     );
 }
 
-// Verifies that the IV is stored verbatim: a server that ignores the
-// requested IV Length and generates 16-byte IVs (as PyKMIP does) round-trips
-// as well as one that honours the requested 12.
+// The IV is stored verbatim: a server that ignores the requested IV Length
+// and generates 16-byte IVs, as PyKMIP 0.11.0 does for AES, round-trips as
+// well as one that honors the requested 12. The mock's Decrypt checks that
+// the IV Length sent back describes the 16-byte IV.
 #[tokio::test]
 async fn a_sixteen_byte_server_iv_round_trips() {
     let (_server, _dir, client) = server_and_client(MockBehavior {
@@ -84,27 +120,33 @@ async fn a_sixteen_byte_server_iv_round_trips() {
     assert_eq!(unwrapped.as_slice(), &dek);
 }
 
-// Verifies that the read-only operations report what the server says:
-// versions, operations with the vendor string, and the key's attributes.
+// The server's facts are reported as sent, so the lists are set to values
+// that differ from the mock's defaults and compared exactly.
 #[tokio::test]
 async fn server_facts_are_reported() {
-    let (_server, _dir, client) = server_and_client(MockBehavior::default()).await;
+    let advertised_operations = vec![
+        Operation::Encrypt,
+        Operation::Decrypt,
+        Operation::Query,
+        Operation::Locate,
+    ];
+    let (_server, _dir, client) = server_and_client(MockBehavior {
+        advertised_versions: vec![(2, 0), (1, 4)],
+        advertised_operations: advertised_operations.clone(),
+        ..MockBehavior::default()
+    })
+    .await;
 
     let versions = client.discover_versions().await.expect("versions");
     assert_eq!(
         versions,
-        [(1, 4), (1, 3), (1, 2)]
+        [(2, 0), (1, 4)]
             .map(|(major, minor)| ProtocolVersion { major, minor })
             .to_vec()
     );
 
     let query = client.query_operations().await.expect("query");
-    assert!(
-        query.operations.contains(&Operation::Encrypt)
-            && query.operations.contains(&Operation::Decrypt),
-        "{:?}",
-        query.operations
-    );
+    assert_eq!(query.operations, advertised_operations);
     assert_eq!(
         query.vendor_identification.as_deref(),
         Some("carbide-kmip mock server")
@@ -122,8 +164,9 @@ async fn server_facts_are_reported() {
     );
 }
 
-// Verifies that a refusal surfaces the server's Result Reason for the three
-// cases the provider maps, and that refusals do not poison the connection.
+// A refusal surfaces the server's Result Reason for the three refusals a
+// caller tells apart (missing object, failed authentication, unusable key),
+// and refusals do not poison the connection.
 #[tokio::test]
 async fn refusals_carry_the_servers_reason_and_keep_the_connection() {
     let (server, _dir, client) = server_and_client(MockBehavior::default()).await;
@@ -160,21 +203,38 @@ async fn refusals_carry_the_servers_reason_and_keep_the_connection() {
     assert_eq!(server.connections(), 1, "refusals reuse the connection");
 }
 
-// Verifies that an Encrypt response missing the IV or the tag is rejected as
-// a protocol violation rather than stored as an incomplete ciphertext.
+// An Encrypt response is only usable with an IV, a 16-byte tag and
+// ciphertext as long as the plaintext; each row corrupts one of those and
+// expects the check that names it, and the connection that carried the
+// unusable response is not reused.
 #[tokio::test]
-async fn an_encrypt_response_without_iv_or_tag_is_a_protocol_violation() {
-    for behavior in [
-        MockBehavior {
-            omit_iv: true,
+async fn an_incomplete_or_inconsistent_encrypt_response_is_a_protocol_violation() {
+    let cases = [
+        (EncryptFault::OmitIv, "encrypt response carries no IV"),
+        (EncryptFault::EmptyIv, "encrypt response carries no IV"),
+        (
+            EncryptFault::OmitTag,
+            "encrypt response carries no authentication tag",
+        ),
+        (
+            EncryptFault::EmptyTag,
+            "encrypt response carries a 0-byte authentication tag, expected 16",
+        ),
+        (
+            EncryptFault::ShortTag,
+            "encrypt response carries a 8-byte authentication tag, expected 16",
+        ),
+        (
+            EncryptFault::LongCiphertext,
+            "encrypt response carries 33 ciphertext bytes for 32 plaintext bytes",
+        ),
+    ];
+    for (fault, expected) in cases {
+        let (server, _dir, client) = server_and_client(MockBehavior {
+            encrypt_fault: Some(fault),
             ..MockBehavior::default()
-        },
-        MockBehavior {
-            omit_tag: true,
-            ..MockBehavior::default()
-        },
-    ] {
-        let (_server, _dir, client) = server_and_client(behavior).await;
+        })
+        .await;
         let error = client
             .encrypt(KEK, &[1u8; 32])
             .await
@@ -187,20 +247,66 @@ async fn an_encrypt_response_without_iv_or_tag_is_a_protocol_violation() {
                     ..
                 }
             ),
-            "{error}"
+            "{fault:?}: {error}"
+        );
+        assert_eq!(protocol_detail(&error), expected, "{fault:?}");
+        client.discover_versions().await.expect("the next call");
+        assert_eq!(
+            server.connections(),
+            2,
+            "{fault:?}: the next call opened a fresh connection"
         );
     }
 }
 
-// Verifies mutual authentication: a client certificate from another CA never
-// gets a request to the server.
+// A response is checked against the request it answers; after a mismatch
+// the connection can no longer be trusted, so the next call opens a new one.
+#[tokio::test]
+async fn a_response_that_does_not_answer_the_request_is_rejected_and_its_connection_dropped() {
+    let cases = [
+        (
+            ResponseFault::WrongUniqueIdentifier,
+            "response names object \"kek-1-other\", expected \"kek-1\"",
+        ),
+        (
+            ResponseFault::OmitBatchItemId,
+            "response carries no Unique Batch Item ID",
+        ),
+        (
+            ResponseFault::WrongProtocolVersion,
+            "response declares protocol version 1.2, expected 1.4",
+        ),
+    ];
+    for (fault, expected) in cases {
+        let (server, _dir, client) = server_and_client(MockBehavior {
+            response_fault: Some(fault),
+            ..MockBehavior::default()
+        })
+        .await;
+        let error = client
+            .encrypt(KEK, &[1u8; 32])
+            .await
+            .expect_err("mismatched response");
+        assert_eq!(protocol_detail(&error), expected, "{fault:?}");
+        client.discover_versions().await.ok();
+        assert_eq!(
+            server.connections(),
+            2,
+            "{fault:?}: the next call opened a fresh connection"
+        );
+    }
+}
+
+// Mutual authentication: a client certificate from another CA never gets a
+// request processed, and the failure of that fresh connection is not retried.
 #[tokio::test]
 async fn an_untrusted_client_certificate_is_rejected_before_any_request() {
     let (server, dir, _client) = server_and_client(MockBehavior::default()).await;
-    let (cert, key) = MockKmipServer::write_untrusted_client_identity(dir.path());
+    let foreign_dir = tempfile::tempdir().expect("temporary directory");
+    let foreign = write_test_pki(foreign_dir.path());
     let mut config = server.client_config_in(dir.path());
-    config.client_cert = cert;
-    config.client_key = key;
+    config.client_cert = foreign.client_cert;
+    config.client_key = foreign.client_key;
     let client = KmipClient::new(config).expect("the material itself is valid");
 
     let error = client
@@ -215,54 +321,126 @@ async fn an_untrusted_client_certificate_is_rejected_before_any_request() {
         "{error}"
     );
     assert_eq!(server.requests(), 0, "no request reached the server");
+    assert_eq!(server.connections(), 1, "a fresh connection is not retried");
 }
 
-// Verifies that the server certificate is checked against the configured
-// server name, not just against the CA bundle.
+// The server certificate must chain to the configured bundle and carry the
+// configured name; an explicit name the certificate does carry is accepted.
 #[tokio::test]
-async fn a_server_name_mismatch_fails_the_connection() {
+async fn the_server_certificate_is_checked_against_the_bundle_and_the_server_name() {
     let (server, dir, _client) = server_and_client(MockBehavior::default()).await;
-    let mut config = server.client_config_in(dir.path());
-    config.server_name = Some("kms.example.invalid".to_string());
-    let client = KmipClient::new(config).expect("client");
-
-    let error = client.discover_versions().await.expect_err("name mismatch");
-    assert!(matches!(error, KmipError::Connect { .. }), "{error}");
+    let foreign_dir = tempfile::tempdir().expect("temporary directory");
+    let foreign = write_test_pki(foreign_dir.path());
+    type Update = fn(&mut KmipClientConfig, &Path);
+    let cases: [(&str, Update, &str); 3] = [
+        (
+            "a server name the certificate carries",
+            |config, _| config.server_name = Some("localhost".to_string()),
+            "ok",
+        ),
+        (
+            "a server name the certificate lacks",
+            |config, _| config.server_name = Some("kms.example.invalid".to_string()),
+            "connect failed",
+        ),
+        (
+            "a CA bundle that did not sign the server certificate",
+            |config, foreign_ca| config.ca_bundle = foreign_ca.to_path_buf(),
+            "connect failed",
+        ),
+    ];
+    for (scenario, update, expected) in cases {
+        let mut config = server.client_config_in(dir.path());
+        update(&mut config, &foreign.ca);
+        let client = KmipClient::new(config).expect("client");
+        let outcome = match client.discover_versions().await {
+            Ok(_) => "ok".to_string(),
+            Err(KmipError::Connect { .. }) => "connect failed".to_string(),
+            Err(other) => format!("unexpected {other}"),
+        };
+        assert_eq!(outcome, expected, "{scenario}");
+    }
 }
 
-// Verifies the request deadline: a stalled server produces a timeout for the
-// operation, and the attempt is not retried.
+// The connect deadline bounds a peer that accepts TCP but never completes
+// TLS, while a refused connection fails at once.
 #[tokio::test]
-async fn a_slow_server_times_out_without_a_retry() {
-    let (server, dir, _client) = server_and_client(MockBehavior {
-        response_delay: Some(Duration::from_secs(5)),
-        ..MockBehavior::default()
-    })
-    .await;
+async fn connecting_is_bounded_by_the_connect_deadline() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let pki = write_test_pki(dir.path());
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("silent listener");
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+    let closed_addr = closed.local_addr().expect("address");
+    drop(closed);
+    let cases = [
+        (
+            "a listener that never completes TLS",
+            silent.local_addr().expect("address"),
+            "connect timed out",
+        ),
+        ("a closed port", closed_addr, "connect failed"),
+    ];
+    for (scenario, addr, expected) in cases {
+        let client = KmipClient::new(KmipClientConfig {
+            endpoint: addr.to_string(),
+            server_name: None,
+            ca_bundle: pki.ca.clone(),
+            client_cert: pki.client_cert.clone(),
+            client_key: pki.client_key.clone(),
+            connect_timeout: Duration::from_millis(200),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+        })
+        .expect("client");
+        let outcome = match client.discover_versions().await {
+            Err(KmipError::ConnectTimeout { .. }) => "connect timed out".to_string(),
+            Err(KmipError::Connect { .. }) => "connect failed".to_string(),
+            Ok(_) => "ok".to_string(),
+            Err(other) => format!("unexpected {other}"),
+        };
+        assert_eq!(outcome, expected, "{scenario}");
+    }
+}
+
+// The request deadline on a reused connection: the stalled call reports that
+// its request was in flight and is not retried, its connection is discarded,
+// and the next call succeeds on a new one.
+#[tokio::test]
+async fn a_timed_out_call_is_not_retried_and_its_connection_is_replaced() {
+    let (server, dir, _client) = server_and_client(stalling(1..2)).await;
     let mut config = server.client_config_in(dir.path());
-    config.request_timeout = Duration::from_millis(200);
+    config.request_timeout = Duration::from_millis(300);
     let client = KmipClient::new(config).expect("client");
 
+    client.discover_versions().await.expect("first call");
     let error = client.discover_versions().await.expect_err("timeout");
     assert!(
         matches!(
             error,
             KmipError::RequestTimeout {
                 operation: Operation::DiscoverVersions,
+                phase: TimeoutPhase::InFlight,
                 ..
             }
         ),
         "{error}"
     );
-    assert_eq!(server.requests(), 1, "sent once, not retried");
+    assert_eq!(server.requests(), 2, "the stalled request was not retried");
+    client.query_operations().await.expect("third call");
+    assert_eq!(
+        (server.connections(), server.requests()),
+        (2, 3),
+        "the stalled connection was replaced"
+    );
 }
 
-// Verifies that waiting for the shared connection counts against the request
-// deadline: a caller queued behind a stalled call expires when its own budget
-// does, not after the first caller's budget plus its own. With the bound both
-// callers finish after about one request timeout; without it the queued
-// caller would take about two, which the elapsed-time assertion rejects with
-// a margin of almost a full timeout on either side.
+// Waiting for the shared connection counts against the request deadline: a
+// caller queued behind a stalled call expires when its own budget does, not
+// after the first caller's budget plus its own, and reports that it sent
+// nothing. With the bound both callers finish after about one request
+// timeout; without it the queued caller would take about two, which the
+// elapsed-time assertion rejects.
 #[tokio::test]
 async fn queued_callers_are_bounded_by_the_request_deadline() {
     const REQUEST_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -276,21 +454,38 @@ async fn queued_callers_are_bounded_by_the_request_deadline() {
     config.request_timeout = REQUEST_TIMEOUT;
     let client = KmipClient::new(config).expect("client");
 
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let (first, second) = tokio::join!(client.discover_versions(), client.discover_versions());
     let elapsed = started.elapsed();
-    for outcome in [first, second] {
-        let error = outcome.expect_err("both calls time out");
-        assert!(matches!(error, KmipError::RequestTimeout { .. }), "{error}");
-    }
+    let phase = |outcome: Result<Vec<ProtocolVersion>, KmipError>| match outcome {
+        Err(KmipError::RequestTimeout { phase, .. }) => phase,
+        other => panic!("expected a request timeout, got {other:?}"),
+    };
+    assert_eq!(phase(first), TimeoutPhase::InFlight);
+    assert_eq!(phase(second), TimeoutPhase::Queued);
     assert!(
         elapsed < REQUEST_TIMEOUT.mul_f32(1.6),
         "the queued caller took {elapsed:?}; the bound is one request timeout, not two"
     );
+    assert_eq!(
+        (server.connections(), server.requests()),
+        (1, 1),
+        "the queued caller neither connected nor sent"
+    );
 }
 
-// Verifies the single retry: a cached connection the server has since closed
-// is replaced transparently, costing one extra connection and no failure.
+#[tokio::test]
+async fn concurrent_callers_share_one_connection() {
+    let (server, _dir, client) = server_and_client(MockBehavior::default()).await;
+
+    let (versions, query) = tokio::join!(client.discover_versions(), client.query_operations());
+    versions.expect("first caller");
+    query.expect("queued caller");
+    assert_eq!((server.connections(), server.requests()), (1, 2));
+}
+
+// A cached connection the server has since closed is replaced transparently,
+// costing one extra connection and no failure.
 #[tokio::test]
 async fn a_closed_cached_connection_is_retried_once() {
     let (server, _dir, client) = server_and_client(MockBehavior {
@@ -307,45 +502,171 @@ async fn a_closed_cached_connection_is_retried_once() {
     assert_eq!((server.connections(), server.requests()), (2, 2));
 }
 
-// Verifies cancellation safety: dropping a call mid-flight drops its
-// connection instead of leaving a half-used one in the cache.
+// The retry's limits: a server that stops answering gets exactly one
+// reconnect before the failure is reported, and a response cut short after
+// its first bytes is not retried at all.
+#[tokio::test]
+async fn the_retry_happens_at_most_once_and_only_before_a_response_byte() {
+    let cases = [
+        (
+            "a server that stops answering",
+            MockBehavior {
+                answer_at_most: Some(1),
+                ..MockBehavior::default()
+            },
+            (2, 3),
+        ),
+        (
+            "a response cut short",
+            MockBehavior {
+                partial_responses_after: Some(1),
+                ..MockBehavior::default()
+            },
+            (1, 2),
+        ),
+    ];
+    for (scenario, behavior, expected_counts) in cases {
+        let (server, _dir, client) = server_and_client(behavior).await;
+        client.discover_versions().await.expect("first call");
+        let error = client
+            .discover_versions()
+            .await
+            .expect_err("the second call fails");
+        assert!(
+            matches!(error, KmipError::Transport { .. }),
+            "{scenario}: {error}"
+        );
+        assert_eq!(
+            (server.connections(), server.requests()),
+            expected_counts,
+            "{scenario}"
+        );
+    }
+}
+
+// Cancellation safety: a call dropped while its request is in flight takes
+// its connection with it, and the next call reconnects and succeeds.
 #[tokio::test]
 async fn a_dropped_call_drops_its_connection() {
-    let (server, dir, _client) = server_and_client(MockBehavior {
-        response_delay: Some(Duration::from_secs(5)),
-        ..MockBehavior::default()
-    })
-    .await;
-    let mut config = server.client_config_in(dir.path());
-    config.request_timeout = Duration::from_millis(300);
-    let client = KmipClient::new(config).expect("client");
+    let (server, _dir, client) = server_and_client(stalling(0..1)).await;
+    let client = Arc::new(client);
 
-    let cancelled =
-        tokio::time::timeout(Duration::from_millis(50), client.discover_versions()).await;
-    assert!(cancelled.is_err(), "the caller's deadline cancels the call");
-    client.discover_versions().await.ok();
+    let in_flight = tokio::spawn({
+        let client = client.clone();
+        async move { client.discover_versions().await }
+    });
+    wait_until(Duration::from_secs(5), || server.requests() == 1).await;
+    in_flight.abort();
+    assert!(
+        in_flight.await.expect_err("aborted").is_cancelled(),
+        "the call was cancelled mid-flight"
+    );
+
+    client.query_operations().await.expect("the next call");
     assert_eq!(
-        server.connections(),
-        2,
+        (server.connections(), server.requests()),
+        (2, 2),
         "the next call opened a fresh connection"
     );
 }
 
-// Verifies construction-time validation: every failure names the field or
-// file at fault, before any connection is attempted.
+// A connection idle longer than the bound is closed before reuse, so a
+// silently dropped connection is not trusted and rotated TLS material is
+// picked up once traffic pauses.
+#[tokio::test]
+async fn an_idle_connection_is_replaced_before_reuse() {
+    let (server, dir, _client) = server_and_client(MockBehavior::default()).await;
+    let client = KmipClient::new(server.client_config_in(dir.path()))
+        .expect("client")
+        .with_max_idle(Duration::from_millis(50));
+
+    client.discover_versions().await.expect("first call");
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    client.discover_versions().await.expect("second call");
+    assert_eq!((server.connections(), server.requests()), (2, 2));
+}
+
+// The TLS files are read again at each connection: material the server
+// rejects is replaced on disk, and the same client is accepted next time.
+#[tokio::test]
+async fn rotated_client_material_is_used_at_the_next_connection() {
+    let (server, dir, _client) = server_and_client(MockBehavior::default()).await;
+    let config = server.client_config_in(dir.path());
+    let foreign_dir = tempfile::tempdir().expect("temporary directory");
+    let foreign = write_test_pki(foreign_dir.path());
+    std::fs::copy(&foreign.client_cert, &config.client_cert).expect("install foreign cert");
+    std::fs::copy(&foreign.client_key, &config.client_key).expect("install foreign key");
+    let client = KmipClient::new(config.clone()).expect("foreign material is valid PEM");
+
+    let error = client
+        .discover_versions()
+        .await
+        .expect_err("the server rejects the foreign identity");
+    assert!(
+        matches!(
+            error,
+            KmipError::Connect { .. } | KmipError::Transport { .. }
+        ),
+        "{error}"
+    );
+
+    let trusted_dir = tempfile::tempdir().expect("temporary directory");
+    let trusted = server.client_config_in(trusted_dir.path());
+    std::fs::copy(&trusted.client_cert, &config.client_cert).expect("restore trusted cert");
+    std::fs::copy(&trusted.client_key, &config.client_key).expect("restore trusted key");
+    client
+        .discover_versions()
+        .await
+        .expect("the rotated material is read at the reconnect");
+    assert_eq!(server.connections(), 2);
+}
+
+#[tokio::test]
+async fn an_oversized_response_is_rejected_from_its_header() {
+    let (_server, _dir, client) = server_and_client(MockBehavior {
+        oversized_response: true,
+        ..MockBehavior::default()
+    })
+    .await;
+
+    let error = client.discover_versions().await.expect_err("too large");
+    assert!(
+        matches!(
+            error,
+            KmipError::ResponseTooLarge { length, max }
+                if length == MAX_RESPONSE_BYTES + 8 && max == MAX_RESPONSE_BYTES
+        ),
+        "{error}"
+    );
+}
+
+// Construction-time validation: every failure names the field or file at
+// fault, before any connection is attempted.
 #[test]
 fn new_rejects_bad_configuration_and_material_naming_the_field() {
     let dir = tempfile::tempdir().expect("temporary directory");
-    let (cert, key) = MockKmipServer::write_untrusted_client_identity(dir.path());
-    let other = dir.path().join("other");
-    std::fs::create_dir(&other).expect("second identity directory");
-    let (other_cert, _other_key) = MockKmipServer::write_untrusted_client_identity(&other);
+    let pki = write_test_pki(dir.path());
+    let other_dir = tempfile::tempdir().expect("temporary directory");
+    let other = write_test_pki(other_dir.path());
     let garbage = dir.path().join("garbage.pem");
     std::fs::write(&garbage, "not pem at all").expect("write garbage");
+    let malformed = dir.path().join("malformed.pem");
+    std::fs::write(
+        &malformed,
+        "-----BEGIN CERTIFICATE-----\nnot base64!\n-----END CERTIFICATE-----\n",
+    )
+    .expect("write malformed PEM");
     let missing = dir.path().join("missing.pem");
-    // Any parsable certificate serves as a CA bundle for parsing purposes.
-    let valid = || KmipClientConfig::new("kms.example.com:5696", &cert, &cert, &key);
-    let with = |update: fn(&mut KmipClientConfig, &std::path::Path)| {
+    let valid = || KmipClientConfig {
+        endpoint: "kms.example.com:5696".to_string(),
+        server_name: None,
+        ca_bundle: pki.ca.clone(),
+        client_cert: pki.client_cert.clone(),
+        client_key: pki.client_key.clone(),
+        connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+        request_timeout: DEFAULT_REQUEST_TIMEOUT,
+    };
+    let with = |update: fn(&mut KmipClientConfig, &Path)| {
         let mut config = valid();
         update(&mut config, dir.path());
         config
@@ -365,38 +686,62 @@ fn new_rejects_bad_configuration_and_material_naming_the_field() {
                     .to_string(),
             },
             Check {
+                scenario: "a connect timeout above its maximum",
+                input: with(|config, _| {
+                    config.connect_timeout = MAX_CONNECT_TIMEOUT + Duration::from_millis(1);
+                }),
+                expect: "kmip connect_timeout: must be greater than zero and at most 60s, got \
+                         60.001s"
+                    .to_string(),
+            },
+            Check {
                 scenario: "an endpoint without a host",
                 input: with(|config, _| config.endpoint = ":5696".to_string()),
                 expect: "kmip endpoint: host is empty".to_string(),
             },
             Check {
+                scenario: "an endpoint host that is not a name, despite a valid server name",
+                input: with(|config, _| {
+                    config.endpoint = "not a host:5696".to_string();
+                    config.server_name = Some("kms.example.com".to_string());
+                }),
+                expect: "kmip endpoint: \"not a host\" is not a valid DNS name or IP address"
+                    .to_string(),
+            },
+            Check {
                 scenario: "a server name that is neither a DNS name nor an IP address",
                 input: with(|config, _| config.server_name = Some("not a name!".to_string())),
-                expect: "kmip tls material: server name \"not a name!\" is not a valid DNS name or IP address"
+                expect: "kmip server_name: \"not a name!\" is not a valid DNS name or IP address"
                     .to_string(),
             },
             Check {
                 scenario: "a missing CA bundle",
                 input: with(|config, dir| config.ca_bundle = dir.join("missing.pem")),
-                expect: format!(
-                    "kmip tls material: failed to read ca_bundle file {}",
-                    missing.display()
-                ),
+                expect: format!("failed to read ca_bundle file {}", missing.display()),
+            },
+            Check {
+                scenario: "a CA bundle that is not valid PEM",
+                input: with(|config, dir| config.ca_bundle = dir.join("malformed.pem")),
+                expect: format!("ca_bundle file {} is not valid PEM", malformed.display()),
             },
             Check {
                 scenario: "a key file holding no key",
                 input: with(|config, dir| config.client_key = dir.join("garbage.pem")),
                 expect: format!(
-                    "kmip tls material: client_key file {} contains no private key",
+                    "client_key file {} contains no private key",
                     garbage.display()
                 ),
             },
             Check {
                 scenario: "a certificate that does not match the key",
-                input: with(|config, dir| config.client_cert = dir.join("other/untrusted-client.pem")),
+                input: {
+                    let mut config = valid();
+                    config.client_cert = other.client_cert.clone();
+                    config
+                },
                 expect: format!(
-                    "kmip tls material: client_cert file {} was rejected",
-                    other_cert.display()
+                    "client_cert file {} was rejected",
+                    other.client_cert.display()
                 ),
             },
         ],

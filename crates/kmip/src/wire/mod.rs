@@ -55,8 +55,10 @@ macro_rules! ttlv_bytes {
 }
 
 /// A KMIP Enumeration: the tag on the enum, the 32-bit value on each variant,
-/// and `Other` for values this crate does not model. `Display` renders the
-/// specification name of the variant.
+/// and `Other` for values this crate does not model. Every variant is
+/// documented with its enumeration value. `Display` renders the variant's
+/// identifier, for example `GetAttributes`, which is what error messages
+/// show. The serde derives exist for the TTLV codec only.
 macro_rules! kmip_enumeration {
     ($(#[$meta:meta])* $vis:vis enum $name:ident = $tag:literal {
         $($variant:ident = $value:literal),+ $(,)?
@@ -65,7 +67,11 @@ macro_rules! kmip_enumeration {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, ::serde::Serialize, ::serde::Deserialize)]
         #[serde(rename = $tag)]
         $vis enum $name {
-            $( #[serde(rename = $value)] $variant, )+
+            $(
+                #[doc = concat!("`", stringify!($variant), "`, enumeration value ", $value, ".")]
+                #[serde(rename = $value)]
+                $variant,
+            )+
             /// A value this crate does not model: a vendor extension or a
             /// newer specification. Never sent by this crate.
             #[serde(other)]
@@ -90,7 +96,7 @@ mod response;
 pub(crate) use common::{
     Attribute, AttributeName, AttributeValue, AuthenticatedEncryptionTag, BatchCount,
     BlockCipherMode, CryptographicParameters, Data, IvCounterNonce, IvLength, MaximumResponseSize,
-    PaddingMethod, QueryFunction, RandomIv, TagLength, UniqueIdentifier,
+    PaddingMethod, QueryFunction, RandomIv, TagLength, UniqueBatchItemId, UniqueIdentifier,
 };
 pub use common::{CryptographicAlgorithm, Operation, ResultReason, ResultStatus, State};
 #[cfg(any(test, feature = "test-support"))]

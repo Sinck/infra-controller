@@ -18,52 +18,118 @@
 //! Error types. Messages are lowercase fragments without trailing periods so
 //! they compose when wrapped by a caller.
 
-use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
+use std::{fmt, io};
 
 use crate::wire::{Operation, ResultReason, ResultStatus};
 
-/// A problem with the configured CA bundle, client certificate, key or server
-/// name. Every variant names the configuration field and file it concerns.
+/// Longest Result Message, in characters, that a [`KmipError::Refused`]
+/// message renders; the server's full text stays in the variant.
+const MAX_RENDERED_RESULT_MESSAGE: usize = 256;
+
+/// One of the three PEM files a [`KmipClientConfig`](crate::KmipClientConfig)
+/// names. `Display` is the configuration field's name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TlsFile {
+    /// `ca_bundle`: the CA certificates trusted to sign the server
+    /// certificate.
+    CaBundle,
+    /// `client_cert`: the certificate chain presented to the server.
+    ClientCert,
+    /// `client_key`: the private key matching `client_cert`.
+    ClientKey,
+}
+
+impl fmt::Display for TlsFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::CaBundle => "ca_bundle",
+            Self::ClientCert => "client_cert",
+            Self::ClientKey => "client_key",
+        })
+    }
+}
+
+/// A problem with the configured CA bundle, client certificate or key. Every
+/// variant but [`Builder`](Self::Builder) names the file it concerns.
 #[derive(Debug, thiserror::Error)]
 pub enum TlsMaterialError {
-    #[error("failed to read {role} file {}", .path.display())]
+    /// The file could not be read.
+    #[error("failed to read {file} file {}", .path.display())]
     Read {
-        role: &'static str,
+        /// Which configured file.
+        file: TlsFile,
+        /// Its configured path.
         path: PathBuf,
+        /// The read failure.
         #[source]
         source: io::Error,
     },
 
-    #[error("{role} file {} is not valid PEM", .path.display())]
+    /// The file is not valid PEM.
+    #[error("{file} file {} is not valid PEM", .path.display())]
     Parse {
-        role: &'static str,
+        /// Which configured file.
+        file: TlsFile,
+        /// Its configured path.
         path: PathBuf,
+        /// The parse failure.
         #[source]
         source: io::Error,
     },
 
-    #[error("{role} file {} contains no {expected}", .path.display())]
+    /// The file is valid PEM but holds none of what it must.
+    #[error("{file} file {} contains no {expected}", .path.display())]
     Empty {
-        role: &'static str,
+        /// Which configured file.
+        file: TlsFile,
+        /// Its configured path.
         path: PathBuf,
+        /// What the file must contain: `certificates` or `private key`.
         expected: &'static str,
     },
 
-    #[error("{role} file {} was rejected", .path.display())]
+    /// The file parsed but rustls rejected its contents, for example a CA
+    /// bundle entry that is not a CA certificate or a client certificate that
+    /// does not match the key.
+    #[error("{file} file {} was rejected", .path.display())]
     Rejected {
-        role: &'static str,
+        /// Which configured file.
+        file: TlsFile,
+        /// Its configured path.
         path: PathBuf,
+        /// The rejection.
         #[source]
         source: rustls::Error,
     },
 
-    #[error("server name {name:?} is not a valid DNS name or IP address")]
-    ServerName { name: String },
-
+    /// The rustls client configuration could not be built from otherwise
+    /// valid material.
     #[error("building the TLS client configuration failed")]
     Builder(#[source] rustls::Error),
+}
+
+/// Which wait a [`KmipError::RequestTimeout`] expired in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TimeoutPhase {
+    /// Waiting for the client's single connection behind another caller;
+    /// nothing was sent.
+    Queued,
+    /// Writing the request or reading its response; whether the server
+    /// applied the request is unknown, and the connection is discarded.
+    InFlight,
+}
+
+impl fmt::Display for TimeoutPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Queued => "waiting for the connection; nothing was sent",
+            Self::InFlight => {
+                "waiting for the response; whether the server applied the request is unknown"
+            }
+        })
+    }
 }
 
 /// Why a KMIP operation did not produce a result.
@@ -71,66 +137,112 @@ pub enum TlsMaterialError {
 /// Transport, protocol and configuration failures are distinct from a
 /// [`KmipError::Refused`] answer, which carries the server's Result Reason and
 /// Result Message so callers can map it (see [`KmipError::is_item_not_found`]).
-/// No variant's message includes request or response payload bytes.
+/// No variant's message includes request or response payload bytes: the
+/// codec's errors name offsets, tags and types only, and a server's Result
+/// Message is rendered quoted and truncated.
 #[derive(Debug, thiserror::Error)]
 pub enum KmipError {
     /// A configuration value failed validation before any connection was made.
     #[error("kmip {field}: {detail}")]
-    InvalidConfig { field: &'static str, detail: String },
-
-    #[error("kmip tls material: {0}")]
-    Tls(#[from] TlsMaterialError),
-
-    /// TCP connect or TLS handshake failed within the connect deadline.
-    #[error("kmip connect to {endpoint} failed")]
-    Connect {
-        endpoint: String,
-        #[source]
-        source: io::Error,
-    },
-
-    #[error("kmip connect to {endpoint} timed out after {timeout:?}")]
-    ConnectTimeout { endpoint: String, timeout: Duration },
-
-    /// The request deadline expired, either while waiting for the client's
-    /// single connection behind another caller, in which case nothing was
-    /// sent, or while writing the request and reading its complete response,
-    /// in which case the connection is discarded and the outcome on the server
-    /// is unknown. Neither case is retried automatically.
-    #[error("kmip {operation} timed out after {timeout:?}")]
-    RequestTimeout {
-        operation: Operation,
-        timeout: Duration,
-    },
-
-    /// The connection failed while exchanging the request.
-    #[error("kmip transport failure during {operation}")]
-    Transport {
-        operation: Operation,
-        #[source]
-        source: io::Error,
-    },
-
-    /// The server's bytes could not be understood as the expected KMIP
-    /// response.
-    #[error("kmip protocol violation during {operation}: {detail}")]
-    Protocol {
-        operation: Operation,
+    InvalidConfig {
+        /// The configuration field at fault.
+        field: &'static str,
+        /// What is wrong with it.
         detail: String,
     },
 
-    /// The response frame announced a length above
-    /// [`MAX_RESPONSE_BYTES`](crate::MAX_RESPONSE_BYTES); nothing past the
-    /// header was read.
-    #[error("kmip response of {length} bytes exceeds the {max} byte limit")]
-    ResponseTooLarge { length: u32, max: u32 },
+    /// The TLS material on disk could not be loaded, at construction or on a
+    /// reconnect.
+    #[error(transparent)]
+    Tls(#[from] TlsMaterialError),
 
-    /// The server answered with a Result Status other than Success.
+    /// The TCP connect or TLS handshake failed within the connect deadline.
+    /// Under TLS 1.3 a server rejects an untrusted client certificate only
+    /// after the handshake, so that case surfaces as
+    /// [`Transport`](Self::Transport) on the first exchange instead.
+    #[error("kmip connect to {endpoint} failed")]
+    Connect {
+        /// The configured endpoint.
+        endpoint: String,
+        /// The connect or handshake failure.
+        #[source]
+        source: io::Error,
+    },
+
+    /// Reading the TLS files, connecting and completing the TLS handshake took
+    /// longer than the connect deadline.
+    #[error("kmip connect to {endpoint} timed out after {timeout:?}")]
+    ConnectTimeout {
+        /// The configured endpoint.
+        endpoint: String,
+        /// The configured connect deadline.
+        timeout: Duration,
+    },
+
+    /// The request deadline expired; `phase` tells whether anything was sent.
+    /// Neither phase is retried automatically.
+    #[error("kmip {operation} timed out after {timeout:?} {phase}")]
+    RequestTimeout {
+        /// The operation attempted.
+        operation: Operation,
+        /// The configured request deadline.
+        timeout: Duration,
+        /// Which wait expired.
+        phase: TimeoutPhase,
+    },
+
+    /// The connection failed while exchanging the request, and is discarded.
+    #[error("kmip transport failure during {operation}")]
+    Transport {
+        /// The operation attempted.
+        operation: Operation,
+        /// The connection failure.
+        #[source]
+        source: io::Error,
+    },
+
+    /// The request could not be encoded, or the server's bytes could not be
+    /// understood as the answer to it: a malformed frame; a batch count,
+    /// operation or Unique Identifier that does not match the request;
+    /// another request's Unique Batch Item ID, or none on a successful
+    /// answer; a successful answer in a protocol version other than 1.4 to
+    /// anything but Discover Versions; a critical Message Extension; or an
+    /// Encrypt result without a usable IV, tag and ciphertext. The connection
+    /// is discarded.
+    #[error("kmip protocol violation during {operation}: {detail}")]
+    Protocol {
+        /// The operation attempted.
+        operation: Operation,
+        /// Which check failed.
+        detail: String,
+        /// The codec's error, when the bytes did not decode at all.
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    },
+
+    /// The response header announced a message of `length` bytes, header
+    /// included, above `max`
+    /// ([`MAX_RESPONSE_BYTES`](crate::MAX_RESPONSE_BYTES)); nothing past the
+    /// header was read and the connection is discarded.
+    #[error("kmip response of {length} bytes exceeds the {max} byte limit")]
+    ResponseTooLarge {
+        /// The announced message size.
+        length: u32,
+        /// The limit it exceeded.
+        max: u32,
+    },
+
+    /// The server answered with a Result Status other than Success. The
+    /// connection stays usable.
     #[error("kmip server refused {operation}: {}", refusal_detail(.status, .reason.as_ref(), .message.as_deref()))]
     Refused {
+        /// The operation attempted.
         operation: Operation,
+        /// The server's Result Status.
         status: ResultStatus,
+        /// The server's Result Reason, when it sent one.
         reason: Option<ResultReason>,
+        /// The server's Result Message, verbatim, when it sent one.
         message: Option<String>,
     },
 }
@@ -168,8 +280,12 @@ fn refusal_detail(
         None => status.to_string(),
     };
     if let Some(message) = message.filter(|message| !message.is_empty()) {
-        detail.push_str(": ");
-        detail.push_str(message);
+        // The server's text is untrusted: quote it and keep it short.
+        let mut rendered: String = message.chars().take(MAX_RENDERED_RESULT_MESSAGE).collect();
+        if message.chars().count() > MAX_RENDERED_RESULT_MESSAGE {
+            rendered.push_str("...");
+        }
+        detail.push_str(&format!(": {rendered:?}"));
     }
     detail
 }

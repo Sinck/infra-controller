@@ -17,21 +17,24 @@
 
 //! A deliberately scoped KMIP 1.4 client.
 //!
-//! The client speaks the OASIS KMIP 1.4 TTLV wire protocol over mutually
-//! authenticated TLS and implements only the operations needed to use a
-//! server-held, non-exportable AES-256 key as a key encryption key:
-//! `DiscoverVersions`, `Query`, `GetAttributes`, single-part `Encrypt` and
-//! single-part `Decrypt` in AES-GCM with a server-generated IV. It never
-//! creates, retrieves, rotates, revokes or destroys keys; those remain
-//! operator-controlled lifecycle operations on the KMIP server.
+//! The client speaks the OASIS KMIP 1.4 TTLV wire protocol, and only that
+//! version, over mutually authenticated TLS, and implements only the
+//! operations needed to use an AES-256 key held by the server as a key
+//! encryption key: `DiscoverVersions`, `Query`, `GetAttributes`, single-part
+//! `Encrypt` and single-part `Decrypt` in AES-GCM with a server-generated IV.
+//! It never creates, retrieves, rotates, revokes or destroys keys; those
+//! remain operator-controlled lifecycle operations on the KMIP server, as does
+//! keeping the key non-exportable.
 //!
 //! The client reports facts about the server (supported versions and
 //! operations, key attributes) and leaves policy decisions, such as refusing a
-//! key that is not `Active`, to its caller.
+//! key that is not `Active` or a server whose `discover_versions()` lacks 1.4,
+//! to its caller. The public enumerations derive serde for the TTLV codec
+//! only; their serialized form is TTLV, not a configuration format.
 //!
 //! Wire encoding uses the [`kmip_ttlv`] serde (de)serializer; the message model
 //! lives in the private `wire` module. The `test-support` feature adds an
-//! in-process mock KMIP server for tests.
+//! in-process mock KMIP server and test PKI files for tests in dependents.
 
 mod client;
 mod config;
@@ -52,8 +55,8 @@ pub use client::{
 };
 pub use config::{
     DEFAULT_CONNECT_TIMEOUT, DEFAULT_PORT, DEFAULT_REQUEST_TIMEOUT, KmipClientConfig,
-    MAX_CONNECT_TIMEOUT, MAX_REQUEST_TIMEOUT,
+    MAX_CONNECT_TIMEOUT, MAX_CONNECTION_IDLE, MAX_REQUEST_TIMEOUT,
 };
-pub use error::{KmipError, TlsMaterialError};
+pub use error::{KmipError, TimeoutPhase, TlsFile, TlsMaterialError};
 pub use framing::MAX_RESPONSE_BYTES;
 pub use wire::{CryptographicAlgorithm, Operation, ResultReason, ResultStatus, State};

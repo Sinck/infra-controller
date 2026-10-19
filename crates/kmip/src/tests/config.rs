@@ -16,6 +16,7 @@
  */
 //! Configuration validation: endpoint parsing and the timeout bounds.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use carbide_test_support::Outcome::*;
@@ -26,9 +27,9 @@ use crate::config::{
     MAX_REQUEST_TIMEOUT, parse_endpoint, validate_timeouts,
 };
 
-// Verifies the endpoint grammar: an optional port after a host or bracketed
-// IPv6 literal, the registered port by default, and rejection of forms that
-// would otherwise connect somewhere unintended.
+// The endpoint grammar: an optional port after a DNS name, an IPv4 address
+// or a bracketed IPv6 literal, the registered port by default, and rejection
+// of every form that could connect somewhere other than intended.
 #[test]
 fn endpoints_parse_with_a_default_port_and_ipv6_literals() {
     scenarios!(run = |endpoint: &str| parse_endpoint(endpoint).map_err(|error| error.to_string());
@@ -40,31 +41,49 @@ fn endpoints_parse_with_a_default_port_and_ipv6_literals() {
         "the registered port is the default" {
             "kms.example.com" => Yields(("kms.example.com".to_string(), 5696)),
             "[2001:db8::1]" => Yields(("2001:db8::1".to_string(), 5696)),
-            "2001:db8::1" => Yields(("2001:db8::1".to_string(), 5696)),
         }
         "malformed endpoints are rejected naming the field" {
             "" => FailsWith("kmip endpoint: host is empty".to_string()),
             ":5696" => FailsWith("kmip endpoint: host is empty".to_string()),
+            "not a host:5696" => FailsWith(
+                "kmip endpoint: \"not a host\" is not a valid DNS name or IP address".to_string()
+            ),
             "kms.example.com:0" => FailsWith("kmip endpoint: invalid port \"0\"".to_string()),
             "kms.example.com:kmip" => FailsWith("kmip endpoint: invalid port \"kmip\"".to_string()),
             "[2001:db8::1" => FailsWith("kmip endpoint: unterminated IPv6 literal".to_string()),
             "[2001:db8::1]x" => FailsWith(
                 "kmip endpoint: unexpected \"x\" after the IPv6 literal".to_string()
             ),
+            "[kms.example.com]:5696" => FailsWith(
+                "kmip endpoint: \"kms.example.com\" in brackets is not an IPv6 literal".to_string()
+            ),
+        }
+        "an unbracketed IPv6 literal is ambiguous and rejected" {
+            // Read as host and port, this would be a different address.
+            "2001:db8::1:5696" => FailsWith(
+                "kmip endpoint: host contains more than one colon; an IPv6 literal must be \
+                 bracketed, as in [2001:db8::1]:5696".to_string()
+            ),
+            "2001:db8::1" => FailsWith(
+                "kmip endpoint: host contains more than one colon; an IPv6 literal must be \
+                 bracketed, as in [2001:db8::1]:5696".to_string()
+            ),
         }
     );
 }
 
-// Verifies that a timeout must be positive and within its hard maximum, and
-// that the failure names the offending field.
+// A timeout must be positive and within its own hard maximum, and the
+// failure names the offending field; the connect and request maxima differ.
 #[test]
 fn timeouts_must_be_positive_and_within_the_hard_maxima() {
-    let config = |connect: Duration, request: Duration| {
-        let mut config =
-            KmipClientConfig::new("kms.example.com", "ca.pem", "client.pem", "client.key");
-        config.connect_timeout = connect;
-        config.request_timeout = request;
-        config
+    let config = |connect: Duration, request: Duration| KmipClientConfig {
+        endpoint: "kms.example.com".to_string(),
+        server_name: None,
+        ca_bundle: PathBuf::from("ca.pem"),
+        client_cert: PathBuf::from("client.pem"),
+        client_key: PathBuf::from("client.key"),
+        connect_timeout: connect,
+        request_timeout: request,
     };
     scenarios!(
         run = |(connect, request)| validate_timeouts(&config(connect, request))
@@ -76,6 +95,10 @@ fn timeouts_must_be_positive_and_within_the_hard_maxima() {
         "zero and above-maximum values are rejected naming the field" {
             (Duration::ZERO, DEFAULT_REQUEST_TIMEOUT) => FailsWith(
                 "kmip connect_timeout: must be greater than zero and at most 60s, got 0ns"
+                    .to_string()
+            ),
+            (MAX_CONNECT_TIMEOUT + Duration::from_millis(1), DEFAULT_REQUEST_TIMEOUT) => FailsWith(
+                "kmip connect_timeout: must be greater than zero and at most 60s, got 60.001s"
                     .to_string()
             ),
             (DEFAULT_CONNECT_TIMEOUT, MAX_REQUEST_TIMEOUT + Duration::from_millis(1)) => FailsWith(

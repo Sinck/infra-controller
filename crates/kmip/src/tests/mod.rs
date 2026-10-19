@@ -14,11 +14,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-//! Unit tests: an independent TTLV oracle, wire vectors, framing, configuration
-//! parsing and client behaviour against the mock server.
+//! Unit tests: an independent TTLV oracle (shared with the client's wire
+//! vectors), framing, configuration parsing and client behavior against the
+//! mock server.
 
 mod client;
 mod config;
 mod framing;
-mod oracle;
-mod vectors;
+pub(crate) mod oracle;

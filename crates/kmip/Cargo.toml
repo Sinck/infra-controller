@@ -21,13 +21,14 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Scoped KMIP 1.4 client that wraps and unwraps data encryption keys with a server-held, non-exportable AES key"
+description = "Scoped KMIP 1.4 client that wraps and unwraps data encryption keys with an AES key held by the server"
 
 [lib]
 name = "carbide_kmip"
 
 [features]
-# An in-process mock KMIP server for tests in this crate and in dependents.
+# An in-process mock KMIP server and test PKI files for tests in this crate
+# and in dependents.
 test-support = ["dep:aes-gcm", "dep:rand", "dep:rcgen"]
 
 [dependencies]
@@ -53,7 +54,8 @@ hex = { workspace = true }
 rand = { workspace = true }
 rcgen = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true }
+tokio-test = { workspace = true }
 
 [lints]
 workspace = true

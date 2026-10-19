@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use super::common::{
     AttributeName, AuthenticatedEncryptionTag, BatchCount, CryptographicParameters, Data,
     IvCounterNonce, MaximumResponseSize, Operation, ProtocolVersion, ProtocolVersionMajor,
-    ProtocolVersionMinor, QueryFunction, UniqueIdentifier,
+    ProtocolVersionMinor, QueryFunction, UniqueBatchItemId, UniqueIdentifier,
 };
 
 /// The protocol version this crate speaks.
@@ -56,12 +56,17 @@ pub(crate) struct RequestHeader {
     pub(crate) batch_count: BatchCount,
 }
 
-/// Request Batch Item, KMIP 1.4 section 7.2.
+/// Request Batch Item, KMIP 1.4 section 7.2. The server echoes the Unique
+/// Batch Item ID in its response (section 7.2 requires it whenever the
+/// request carried one), which lets the client check that a response answers
+/// the request it is waiting for.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename = "0x42000F")]
 pub(crate) struct RequestBatchItem<P> {
     #[serde(rename = "0x42005C")]
     pub(crate) operation: Operation,
+    #[serde(rename = "0x420093", skip_serializing_if = "Option::is_none")]
+    pub(crate) unique_batch_item_id: Option<UniqueBatchItemId>,
     #[serde(rename = "0x420079")]
     pub(crate) payload: P,
 }
@@ -83,7 +88,7 @@ pub(crate) struct QueryRequestPayload {
     pub(crate) query_functions: Vec<QueryFunction>,
 }
 
-/// Get Attributes request payload, KMIP 1.4 section 4.11.
+/// Get Attributes request payload, KMIP 1.4 section 4.12.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename = "0x420079")]
 pub(crate) struct GetAttributesRequestPayload {

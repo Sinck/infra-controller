@@ -45,39 +45,39 @@ fn item(tag: u32, item_type: u8, value: &[u8]) -> Vec<u8> {
     out
 }
 
-pub(super) fn structure(tag: u32, children: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn structure(tag: u32, children: &[Vec<u8>]) -> Vec<u8> {
     item(tag, TYPE_STRUCTURE, &children.concat())
 }
 
-pub(super) fn integer(tag: u32, value: i32) -> Vec<u8> {
+pub(crate) fn integer(tag: u32, value: i32) -> Vec<u8> {
     item(tag, TYPE_INTEGER, &value.to_be_bytes())
 }
 
-pub(super) fn long_integer(tag: u32, value: i64) -> Vec<u8> {
+pub(crate) fn long_integer(tag: u32, value: i64) -> Vec<u8> {
     item(tag, TYPE_LONG_INTEGER, &value.to_be_bytes())
 }
 
-pub(super) fn enumeration(tag: u32, value: u32) -> Vec<u8> {
+pub(crate) fn enumeration(tag: u32, value: u32) -> Vec<u8> {
     item(tag, TYPE_ENUMERATION, &value.to_be_bytes())
 }
 
-pub(super) fn boolean(tag: u32, value: bool) -> Vec<u8> {
+pub(crate) fn boolean(tag: u32, value: bool) -> Vec<u8> {
     item(tag, TYPE_BOOLEAN, &u64::from(value).to_be_bytes())
 }
 
-pub(super) fn text(tag: u32, value: &str) -> Vec<u8> {
+pub(crate) fn text(tag: u32, value: &str) -> Vec<u8> {
     item(tag, TYPE_TEXT_STRING, value.as_bytes())
 }
 
-pub(super) fn bytes(tag: u32, value: &[u8]) -> Vec<u8> {
+pub(crate) fn bytes(tag: u32, value: &[u8]) -> Vec<u8> {
     item(tag, TYPE_BYTE_STRING, value)
 }
 
-pub(super) fn date_time(tag: u32, seconds: i64) -> Vec<u8> {
+pub(crate) fn date_time(tag: u32, seconds: i64) -> Vec<u8> {
     item(tag, TYPE_DATE_TIME, &seconds.to_be_bytes())
 }
 
-pub(super) fn interval(tag: u32, seconds: u32) -> Vec<u8> {
+pub(crate) fn interval(tag: u32, seconds: u32) -> Vec<u8> {
     item(tag, TYPE_INTERVAL, &seconds.to_be_bytes())
 }
 

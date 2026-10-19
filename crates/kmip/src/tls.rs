@@ -25,11 +25,18 @@ use rustls_pki_types::CertificateDer;
 use zeroize::Zeroizing;
 
 use crate::config::KmipClientConfig;
-use crate::error::TlsMaterialError;
+use crate::error::{TlsFile, TlsMaterialError};
 
-const CA_BUNDLE: &str = "ca_bundle";
-const CLIENT_CERT: &str = "client_cert";
-const CLIENT_KEY: &str = "client_key";
+impl TlsFile {
+    /// The path the configuration names for this file.
+    fn path(self, config: &KmipClientConfig) -> &Path {
+        match self {
+            Self::CaBundle => &config.ca_bundle,
+            Self::ClientCert => &config.client_cert,
+            Self::ClientKey => &config.client_key,
+        }
+    }
+}
 
 /// The three PEM files named by the configuration, read but not yet parsed.
 pub(crate) struct PemMaterial {
@@ -42,17 +49,18 @@ pub(crate) struct PemMaterial {
 pub(crate) fn read_material_blocking(
     config: &KmipClientConfig,
 ) -> Result<PemMaterial, TlsMaterialError> {
-    let read = |role: &'static str, path: &Path| {
+    let read = |file: TlsFile| {
+        let path = file.path(config);
         std::fs::read(path).map_err(|source| TlsMaterialError::Read {
-            role,
+            file,
             path: path.to_path_buf(),
             source,
         })
     };
     Ok(PemMaterial {
-        ca_bundle: read(CA_BUNDLE, &config.ca_bundle)?,
-        client_cert: read(CLIENT_CERT, &config.client_cert)?,
-        client_key: Zeroizing::new(read(CLIENT_KEY, &config.client_key)?),
+        ca_bundle: read(TlsFile::CaBundle)?,
+        client_cert: read(TlsFile::ClientCert)?,
+        client_key: Zeroizing::new(read(TlsFile::ClientKey)?),
     })
 }
 
@@ -60,19 +68,20 @@ pub(crate) fn read_material_blocking(
 pub(crate) async fn read_material(
     config: &KmipClientConfig,
 ) -> Result<PemMaterial, TlsMaterialError> {
-    async fn read(role: &'static str, path: &Path) -> Result<Vec<u8>, TlsMaterialError> {
+    async fn read(file: TlsFile, config: &KmipClientConfig) -> Result<Vec<u8>, TlsMaterialError> {
+        let path = file.path(config);
         tokio::fs::read(path)
             .await
             .map_err(|source| TlsMaterialError::Read {
-                role,
+                file,
                 path: path.to_path_buf(),
                 source,
             })
     }
     Ok(PemMaterial {
-        ca_bundle: read(CA_BUNDLE, &config.ca_bundle).await?,
-        client_cert: read(CLIENT_CERT, &config.client_cert).await?,
-        client_key: Zeroizing::new(read(CLIENT_KEY, &config.client_key).await?),
+        ca_bundle: read(TlsFile::CaBundle, config).await?,
+        client_cert: read(TlsFile::ClientCert, config).await?,
+        client_key: Zeroizing::new(read(TlsFile::ClientKey, config).await?),
     })
 }
 
@@ -83,24 +92,24 @@ pub(crate) fn build_client_config(
     material: &PemMaterial,
 ) -> Result<ClientConfig, TlsMaterialError> {
     let mut roots = RootCertStore::empty();
-    for certificate in parse_certificates(CA_BUNDLE, &config.ca_bundle, &material.ca_bundle)? {
+    for certificate in parse_certificates(TlsFile::CaBundle, config, &material.ca_bundle)? {
         roots
             .add(certificate)
             .map_err(|source| TlsMaterialError::Rejected {
-                role: CA_BUNDLE,
+                file: TlsFile::CaBundle,
                 path: config.ca_bundle.clone(),
                 source,
             })?;
     }
-    let chain = parse_certificates(CLIENT_CERT, &config.client_cert, &material.client_cert)?;
+    let chain = parse_certificates(TlsFile::ClientCert, config, &material.client_cert)?;
     let key = rustls_pemfile::private_key(&mut material.client_key.as_slice())
         .map_err(|source| TlsMaterialError::Parse {
-            role: CLIENT_KEY,
+            file: TlsFile::ClientKey,
             path: config.client_key.clone(),
             source,
         })?
         .ok_or_else(|| TlsMaterialError::Empty {
-            role: CLIENT_KEY,
+            file: TlsFile::ClientKey,
             path: config.client_key.clone(),
             expected: "private key",
         })?;
@@ -110,27 +119,28 @@ pub(crate) fn build_client_config(
         .with_root_certificates(roots)
         .with_client_auth_cert(chain, key)
         .map_err(|source| TlsMaterialError::Rejected {
-            role: CLIENT_CERT,
+            file: TlsFile::ClientCert,
             path: config.client_cert.clone(),
             source,
         })
 }
 
 fn parse_certificates(
-    role: &'static str,
-    path: &Path,
+    file: TlsFile,
+    config: &KmipClientConfig,
     pem: &[u8],
 ) -> Result<Vec<CertificateDer<'static>>, TlsMaterialError> {
+    let path = file.path(config);
     let certificates = rustls_pemfile::certs(&mut &pem[..])
         .collect::<Result<Vec<_>, _>>()
         .map_err(|source| TlsMaterialError::Parse {
-            role,
+            file,
             path: path.to_path_buf(),
             source,
         })?;
     if certificates.is_empty() {
         return Err(TlsMaterialError::Empty {
-            role,
+            file,
             path: path.to_path_buf(),
             expected: "certificates",
         });

@@ -15,9 +15,12 @@
  * limitations under the License.
  */
 //! Test support: an in-process mock KMIP server speaking the same scoped
-//! subset over mutual TLS, with switches for the server behaviours the client
-//! must tolerate or reject.
+//! subset over mutual TLS, with switches for the server behaviors the client
+//! must tolerate or reject, and PEM files for tests that run a real server.
 
 mod mock_server;
 
-pub use mock_server::{MockBehavior, MockKey, MockKmipServer};
+pub use mock_server::{
+    EncryptFault, MockBehavior, MockKey, MockKmipServer, ResponseFault, TestPkiFiles,
+    write_test_pki,
+};
