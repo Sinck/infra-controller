@@ -111,17 +111,20 @@ impl<K: Eq + Hash, F: PartialEq, C: Clone> ClientCache<K, F, C> {
     /// Returns the client cached under `key`, or, when none is cached or the
     /// cached one is stale, builds one with `build`, caches it, and returns it.
     ///
-    /// A cached client is stale when it was built with a different
-    /// `fingerprint`, or when a file in `tls_material`, the on-disk material
-    /// `build` loads, was modified after the client's build started and the
-    /// modification time of every file in `tls_material` can be read. A file
-    /// whose modification time cannot be read, such as one a rotation has
-    /// removed and not yet replaced, keeps a newer file from making the client
-    /// stale, because `build` could not load the material yet. A future-dated
-    /// modification time, such as from writer clock skew, makes every call
-    /// rebuild until the clock passes it. Each unreadable file, and the first
-    /// newer file when it makes the client stale, are reported to the handler
-    /// passed to [`ClientCache::new`].
+    /// A cached client is stale when either of the following is true:
+    ///
+    /// - the client was built with a different `fingerprint`
+    /// - a file in `tls_material` (the on-disk material loaded by `build`) was
+    ///   modified after the client's build started, *and* the modification
+    ///   time of every file in `tls_material` can be read.
+    ///
+    /// A file whose modification time cannot be read, such as one a rotation
+    /// has removed but not yet replaced, keeps a newer file from making the
+    /// client stale, because `build` could not yet load the material. A
+    /// future-dated modification time, such as from writer clock skew, makes
+    /// every call rebuild until the clock passes it. All unreadable files, and
+    /// the first newer file that makes the client stale, are reported to the
+    /// handler passed to [`ClientCache::new`].
     ///
     /// A stale client is never returned, but it stays cached until a rebuild
     /// succeeds and replaces it. When `build` fails, its error is returned and
@@ -175,7 +178,7 @@ impl<K: Eq + Hash, F: PartialEq, C: Clone> ClientCache<K, F, C> {
 
     /// True when a file in `tls_material` was modified after `created` and
     /// every file's modification time can be read. Reports each unreadable
-    /// file, and the first newer file when it makes this true.
+    /// file, and the first newer file that makes this true.
     async fn tls_material_rotated_since(
         &self,
         tls_material: &[impl AsRef<Path>],

@@ -499,7 +499,7 @@ certificate in the Secret before NICo asks RMS to install it.
 NMX-C client pool rebuilds a cached channel when it detects newer CA, client
 certificate, or client key files, and the certificate monitor uses the
 current mounted material on subsequent probes. If one of those files is
-missing when the pool checks, for example partway through a rotation that
+missing when the pool checks, such as partway through a rotation that
 replaces the files one at a time, the pool keeps using its cached channel
 until the file is back. Changes to the TOML settings themselves require a
 `nico-api` restart or rollout.
