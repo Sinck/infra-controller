@@ -90,7 +90,7 @@ keys = { "site-kek-1" = "f0a1c2d3-5e6f-4a7b-8c9d-0e1f2a3b4c5d" }
 | `connect_timeout` | no | `5s` | Per-attempt bound on reading the TLS files, the TCP connect, and the TLS handshake together. At most `60s`. |
 | `request_timeout` | no | `10s` | Per-attempt bound on writing a request and reading its complete response. It also bounds how long a caller waits for the single connection behind another caller. At most `120s`. |
 
-Every value is read at startup and a change requires a `nico-api` restart, as for the rest of `[secrets]`.
+Every value in this table is read at startup, so a change to the TOML requires a `nico-api` restart, as for the rest of `[secrets]`. The files behind `ca_bundle`, `client_cert`, and `client_key` are the exception: the provider reads them again whenever it opens a connection, as described above.
 
 ## What Startup Verifies
 
