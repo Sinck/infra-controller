@@ -25,6 +25,7 @@ use model::ib::{
 };
 
 use super::iface::{Filter, GetPartitionOptions, IBFabricRawResponse};
+pub(super) use super::ufmclient::AuthMethod;
 use super::ufmclient::{
     self, Partition, PartitionKey, PartitionQoS, Port, PortConfig, PortMembership, SmConfig,
     UFMCert, UFMConfig, UFMError, Ufm,
@@ -38,15 +39,6 @@ pub(super) struct RestIBFabric {
 
 const DEFAULT_INDEX0: bool = true;
 const DEFAULT_MEMBERSHIP: PortMembership = PortMembership::Full;
-
-/// How a UFM client authenticates, as resolved by [`auth_method`].
-#[derive(Clone)]
-pub(super) enum AuthMethod {
-    /// A bearer token.
-    Token(String),
-    /// Client-certificate files on disk.
-    Cert(UFMCert),
-}
 
 /// Detects the authentication method `auth` selects: a bearer token, or
 /// client-certificate files on disk. Certificate authentication is chosen for
@@ -75,16 +67,9 @@ pub(super) fn auth_method(auth: &str) -> AuthMethod {
 /// Builds a client for the UFM at `addr` that authenticates with `auth`, as
 /// [`auth_method`] resolved it.
 pub(super) fn new_client(addr: &str, auth: AuthMethod) -> Result<Arc<dyn IBFabric>, IbError> {
-    let (token, cert) = match auth {
-        AuthMethod::Token(token) => (Some(token), None),
-        AuthMethod::Cert(cert) => (None, Some(cert)),
-    };
     let conf = UFMConfig {
         address: addr.to_string(),
-        username: None,
-        password: None,
-        token,
-        cert,
+        auth,
     };
 
     let ufm = ufmclient::new_client(conf).map_err(IbError::from)?;
