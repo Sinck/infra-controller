@@ -3840,7 +3840,7 @@ async fn handle_dpu_reprovision(
                     )));
                 }
 
-                if !managed_host_network_config_version_synced_and_dpu_healthy(
+                if let Some(not_ready_reason) = dpu_network_not_ready_reason(
                     dsnapshot,
                     state.host_snapshot.network_config.version,
                 ) {
@@ -3864,14 +3864,19 @@ async fn handle_dpu_reprovision(
                                 reachability_params,
                                 ctx,
                             )
-                            .await?,
+                            .await
+                            .map_err(|e| {
+                                dpu_network_not_ready_error(e, &dsnapshot.id, not_ready_reason)
+                            })?,
                         );
                     }
-                    // TODO: Make is_network_ready give us more details as a string
-                    return Ok(StateHandlerOutcome::wait(format!(
-                        "Waiting for DPU {} to sync network config/become healthy;\nreboot status: {reboot_status:#?}",
-                        dsnapshot.id
-                    )));
+                    return Ok(StateHandlerOutcome::wait(
+                        dpu_network_not_ready_wait_message(
+                            &dsnapshot.id,
+                            not_ready_reason,
+                            &reboot_status,
+                        ),
+                    ));
                 }
             }
 
@@ -5337,7 +5342,7 @@ impl DpuMachineStateHandler {
                             // let the trigger_reboot_if_needed determine if we are stuck here
                             // (based on how long it has been since the last requested reboot)
                             reboot_status = Some(
-                                match trigger_reboot_if_needed(
+                                trigger_reboot_if_needed(
                                     dsnapshot,
                                     state,
                                     None,
@@ -5345,27 +5350,19 @@ impl DpuMachineStateHandler {
                                     ctx,
                                 )
                                 .await
-                                {
-                                    Ok(status) => status,
-                                    // Name the blocker so the error does not read as a
-                                    // generic unresponsive machine.
-                                    Err(StateHandlerError::ManualInterventionRequired(msg)) => {
-                                        return Err(StateHandlerError::ManualInterventionRequired(
-                                            format!(
-                                                "DPU {} is not network ready: {not_ready_reason}; {msg}",
-                                                dsnapshot.id
-                                            ),
-                                        ));
-                                    }
-                                    Err(e) => return Err(e),
-                                },
+                                .map_err(|e| {
+                                    dpu_network_not_ready_error(e, &dsnapshot.id, not_ready_reason)
+                                })?,
                             );
                         }
 
-                        return Ok(StateHandlerOutcome::wait(format!(
-                            "Waiting for DPU agent to apply network config and report healthy network for DPU {}: {not_ready_reason}\nreboot status: {reboot_status:#?}",
-                            dsnapshot.id
-                        )));
+                        return Ok(StateHandlerOutcome::wait(
+                            dpu_network_not_ready_wait_message(
+                                &dsnapshot.id,
+                                not_ready_reason,
+                                &reboot_status,
+                            ),
+                        ));
                     }
                 }
 
@@ -6269,13 +6266,6 @@ impl HostMachineStateHandler {
     }
 }
 
-fn managed_host_network_config_version_synced_and_dpu_healthy(
-    dpu_snapshot: &DpuMachine,
-    host_version: ConfigVersion,
-) -> bool {
-    dpu_network_not_ready_reason(dpu_snapshot, host_version).is_none()
-}
-
 /// Returns why the DPU does not yet count as network-ready, or `None` if it is.
 fn dpu_network_not_ready_reason(
     dpu_snapshot: &DpuMachine,
@@ -6294,6 +6284,35 @@ fn dpu_network_not_ready_reason(
     dpu_health
         .has_classification(&health_report::HealthAlertClassification::prevent_host_state_changes())
         .then_some("check the DPU health alerts")
+}
+
+/// Wait message for a DPU that is not yet network ready, shared by the DPU init and
+/// reprovision paths.
+fn dpu_network_not_ready_wait_message(
+    dpu_id: &DpuMachineId,
+    not_ready_reason: &str,
+    reboot_status: &Option<RebootStatus>,
+) -> String {
+    format!(
+        "Waiting for DPU agent to apply network config and report healthy network for DPU {dpu_id}: {not_ready_reason}\nreboot status: {reboot_status:#?}"
+    )
+}
+
+/// Names the blocker when the reboot attempts for a DPU that is not network ready run
+/// out, so the error does not read as a generic unresponsive machine.
+fn dpu_network_not_ready_error(
+    error: StateHandlerError,
+    dpu_id: &DpuMachineId,
+    not_ready_reason: &str,
+) -> StateHandlerError {
+    match error {
+        StateHandlerError::ManualInterventionRequired(msg) => {
+            StateHandlerError::ManualInterventionRequired(format!(
+                "DPU {dpu_id} is not network ready: {not_ready_reason}; {msg}"
+            ))
+        }
+        other => other,
+    }
 }
 
 fn check_host_health_for_alerts(state: &ManagedHostStateSnapshot) -> Result<(), StateHandlerError> {
@@ -15103,12 +15122,7 @@ mod tests {
                             .push(alert);
                     }
                 }
-                let reason = dpu_network_not_ready_reason(&dpu, host_version);
-                assert_eq!(
-                    managed_host_network_config_version_synced_and_dpu_healthy(&dpu, host_version),
-                    reason.is_none()
-                );
-                reason
+                dpu_network_not_ready_reason(&dpu, host_version)
             },
         );
     }
