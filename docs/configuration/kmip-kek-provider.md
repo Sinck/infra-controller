@@ -1,6 +1,6 @@
 # KMIP KEK Provider
 
-A KMIP key encryption key (KEK) provider keeps the key that protects the NICo credentials store inside a KMIP 1.4 server such as a hardware security module or an enterprise key manager. NICo generates each per-credential data encryption key (DEK) locally, sends only that DEK to the server's `Encrypt` operation, and stores the returned ciphertext, IV, and authentication tag next to the credential. Unwrapping uses the matching `Decrypt` operation. The KEK is non-exportable and never enters NICo configuration or memory, which is the same custody model as Vault/OpenBao Transit without the Vault dependency.
+A KMIP key encryption key (KEK) provider keeps the key that protects the NICo credentials store inside a KMIP 1.4 server such as a hardware security module or an enterprise key manager. NICo generates each per-credential data encryption key (DEK) locally, sends only that DEK to the server's `Encrypt` operation, and stores the returned ciphertext, IV, and authentication tag next to the credential. Unwrapping uses the matching `Decrypt` operation. The KEK is marked non-exportable on the server and never enters NICo configuration or memory, which is the same custody model as Vault/OpenBao Transit without the Vault dependency.
 
 This page covers what the server must provide, how to create the key and the client identity, how to mount the TLS material through Helm, the `[secrets.kms]` configuration, what `nico-api` verifies at startup, day-to-day operation, and the qualification status of server products. The surrounding credentials-store model, routing, rotation, and migration walk are in [Secrets Storage](secrets-storage.md).
 
@@ -13,21 +13,21 @@ The client is deliberately narrow. It speaks the KMIP 1.4 TTLV protocol over mut
 | `Discover Versions` | startup | The server must list protocol version 1.4. |
 | `Query` | startup | The server must list the `Encrypt` and `Decrypt` operations. |
 | `Get Attributes` | startup | Each configured key must be `Active`, algorithm `AES`, length 256 bits, with `Encrypt` and `Decrypt` in its cryptographic usage mask. |
-| `Encrypt` | every credential write and re-wrap | Single-part AES-GCM, no padding, a 96-bit server-generated IV (`Random IV`), and a 16-byte authentication tag returned in the `Authenticated Encryption Tag` field. |
+| `Encrypt` | every credential write and re-wrap | Single-part AES-GCM with no padding. The request asks for a server-generated IV (`Random IV`, 96-bit `IV Length`) and a 16-byte tag. The response must carry a non-empty IV in `IV/Counter/Nonce`, exactly 16 tag bytes in `Authenticated Encryption Tag`, and ciphertext as long as the plaintext. The IV is stored as returned, whatever its length. |
 | `Decrypt` | every credential read and re-wrap | The stored IV and tag are sent as separate fields together with the ciphertext. |
 
-The provider never creates, activates, rotates, revokes, or destroys keys. Multi-part operations, additional authenticated data, and KMIP 2.x wire encodings are not used. A server that returns the authentication tag appended to the ciphertext instead of in its own field, or that ignores `Random IV`, fails the startup probe described below; it is not a supported configuration.
+The provider never creates, activates, rotates, revokes, or destroys keys. Multi-part operations, additional authenticated data, and KMIP 2.x wire encodings are not used. The client checks the shape of every `Encrypt` response, so a server that omits the IV, returns a tag of another length, or appends the tag to the ciphertext instead of returning it in its own field fails the startup probe described below. The client cannot tell whether the IV it receives is fresh: a server that ignores `Random IV` and returns a fixed IV passes the probe, and a repeated IV under the same key breaks AES-GCM. Fresh IVs on every `Encrypt` are therefore a qualification requirement, checked as described in [Qualification Checklist](#qualification-checklist), not a startup check.
 
 ## Create the KEK and the Client Identity
 
 Perform these steps on the KMIP server with its own tools. Names and menus differ by product; the KMIP concepts do not.
 
-1. Create a symmetric key with algorithm `AES`, length `256`, and a cryptographic usage mask containing `Encrypt` and `Decrypt`. Do not set usage limits on the key: the client may repeat an `Encrypt` once on a stale connection, and a usage counter would count that repeat.
+1. Create a symmetric key with algorithm `AES`, length `256`, a cryptographic usage mask containing `Encrypt` and `Decrypt`, and the server's export protection turned on. In KMIP terms that is the `Extractable` attribute set to `False`; a server sets it to `True` when the request omits it (section 3.50 of the [KMIP 1.4 specification](https://docs.oasis-open.org/kmip/spec/v1.4/os/kmip-spec-v1.4-os.html)), and products often expose it as their own export or extractability control. Confirm the setting with the product's own tools after creation, because NICo's startup checks read the key's state, algorithm, length, and usage mask, not its extractability. Do not set usage limits on the key: the client may repeat an `Encrypt` once on a stale connection, and a usage counter would count that repeat.
 2. Activate the key and record its KMIP Unique Identifier. That identifier, not a name, goes into the NICo configuration.
 3. Issue a TLS client certificate for `nico-api` from a CA the server trusts, and map that certificate to a server-side identity whose permissions on the key are limited to `Encrypt`, `Decrypt`, `Get Attributes`, `Query`, and `Discover Versions`. The identity must not be able to export, rotate, revoke, or destroy the key.
 4. Collect the PEM bundle of the CA that signed the server certificate. The provider trusts only that bundle, never system roots.
 
-Rotation is a NICo routing change, as for every provider: create and activate a second key, add it under a new `kek_id`, point `[secrets.routing]` at it, and run `nico-admin-cli secrets re-wrap` as described in [Rotating and Retiring Keys](secrets-storage.md#rotating-and-retiring-keys). Keep the old key active on the server until the re-wrap reports no stale rows and every retained database dump that references it has aged out.
+Rotation is a NICo routing change, as for every provider, and it takes two rollouts because a rolling update runs old and new pods side by side, as described in [Before You Start](secrets-storage.md#before-you-start). Create and activate a second key on the server and add it to `keys` under a new `kek_id`, leaving `[secrets.routing]` unchanged; restart and wait for every old pod to terminate, so that no replica can meet a `kek_id` it does not know. Then point `[secrets.routing]` at the new `kek_id`, restart again, and run `nico-admin-cli secrets re-wrap` as described in [Rotating and Retiring Keys](secrets-storage.md#rotating-and-retiring-keys). Keep the old key active on the server until the re-wrap reports no stale rows and every retained database dump that references it has aged out.
 
 ## Mount the TLS Material
 
@@ -100,7 +100,7 @@ Before `nico-api` serves traffic it connects to the server and checks, in this o
 2. `Discover Versions` lists KMIP 1.4.
 3. `Query` lists `Encrypt` and `Decrypt`.
 4. For every entry in `keys`, `Get Attributes` reports state `Active`, algorithm `AES`, length `256`, and a usage mask that permits `Encrypt` and `Decrypt`.
-5. For every entry in `keys`, a throwaway 32-byte value wraps and unwraps through the server, which proves that the server returns an IV and an authentication tag that round-trip.
+5. For every entry in `keys`, a throwaway 32-byte value wraps and unwraps through the server. This proves that the server answers `Encrypt` with a non-empty IV, a 16-byte tag in its own field, and ciphertext of the plaintext's length, and that `Decrypt` returns the original value. It does not prove that the IV is fresh on every call; see [Qualification Checklist](#qualification-checklist).
 
 An unreachable server therefore stops `nico-api` from starting rather than failing credential operations later. Kubernetes restarts the pod until the server is reachable again. These checks run in addition to the routing checks in [Secrets Storage](secrets-storage.md#kms-providers).
 
@@ -114,7 +114,13 @@ An unreachable server therefore stops `nico-api` from starting rather than faili
 
 ### Migrating from Transit
 
-The migration reuses the multi-provider, routing, and re-wrap mechanics of [Secrets Storage](secrets-storage.md#rotating-and-retiring-keys). Add the `kmip` provider next to the existing `transit` provider, set `active` to the KMIP provider, route every prefix to a KMIP `kek_id`, restart, and run `nico-admin-cli secrets re-wrap`. Transit stays configured and unwraps old rows until `stale_remaining` reaches zero and the rollback and backup-retention windows have passed. Rolling back is the mirror image: set `active` back to Transit, reverse the routing, restart, and re-wrap again, keeping the KMIP provider configured until its rows are gone.
+The migration reuses the multi-provider, routing, and re-wrap mechanics of [Secrets Storage](secrets-storage.md#rotating-and-retiring-keys). It takes two rollouts, because a rolling update runs old and new pods side by side, as described in [Before You Start](secrets-storage.md#before-you-start):
+
+1. **Distribute the provider.** Add the `kmip` provider, its TLS mounts, and its `keys` next to the existing `transit` provider, leaving `active` and `[secrets.routing]` on Transit. Restart and wait for every old pod to terminate. Every replica now holds both providers and can unwrap rows written under either, but no replica writes under a KMIP `kek_id` yet. Startup validation runs against the KMIP server in this step, so a misconfigured provider fails here, before any row depends on it.
+2. **Switch writes.** Set `active` to the KMIP provider, route every prefix to a KMIP `kek_id` that step 1 distributed, restart, and wait for the rollout to finish. A `kek_id` first added in this step would bring back the problem step 1 avoids. A pod still on the previous configuration can read everything the new pods write, because it already holds the KMIP provider.
+3. **Re-wrap.** Run `nico-admin-cli secrets re-wrap`. Transit stays configured and unwraps old rows until `stale_remaining` reaches zero and the rollback and backup-retention windows have passed.
+
+Skipping the first rollout lets a new pod write a credential under a KMIP `kek_id` while an old pod that knows only Transit is still serving; that pod cannot read the new row until it terminates. Rolling back is the mirror image: set `active` back to Transit, reverse the routing, restart, and re-wrap again, keeping the KMIP provider configured until its rows are gone. Because every replica already holds both providers, the rollback needs one rollout.
 
 ## Qualified Server Products
 
@@ -130,15 +136,18 @@ Run the whole list against the product, and record the product name and version,
 
 1. Startup validation passes with the key created as described above, and fails with a message naming the field when the Unique Identifier is wrong or the identity lacks a permission.
 2. A credential written with `nico-admin-cli credential add-*` reads back, and the row's wrapped DEK unwraps after a `nico-api` restart.
-3. Stopping one server node, or forcing a cluster failover, produces `carbide_external_call_duration_milliseconds{backend="kmip",outcome="error"}` observations that stop without a `nico-api` restart once the service is back.
-4. Removing the identity's `Encrypt` and `Decrypt` permissions on the key, a change the server can undo, makes writes fail with an encryption error and reads with a decryption error without crashing `nico-api`, and restoring the permissions restores both without a restart. Do not use key deactivation for this step: a conforming server cannot return a Deactivated key to Active, and may still decrypt with it.
-5. A migration from Transit and its rollback complete with `secrets re-wrap` reporting zero stale rows in each direction.
-6. A database dump restored against the same key reads back.
-7. The table above gains the product's row.
+3. The vendor's documentation or support states that `Random IV` yields a unique IV for every `Encrypt` under a key, across connections and failover; record that statement. As a smoke test, write several credentials that route to the same `kek_id`, some before and some after a `nico-api` restart and a server failover, and check that their `dek_nonce` values in the `secrets` table are all different and have the IV length recorded above. The samples rule out a fixed IV or a counter that restarts with each connection; they do not prove uniqueness, which is why the vendor statement is required.
+4. The product's own tools show the key as non-extractable, as step 1 of key creation requires.
+5. Stopping one server node, or forcing a cluster failover, produces `carbide_external_call_duration_milliseconds{backend="kmip",outcome="error"}` observations that stop without a `nico-api` restart once the service is back.
+6. Removing the identity's `Encrypt` and `Decrypt` permissions on the key, a change the server can undo, makes writes fail with an encryption error and reads with a decryption error without crashing `nico-api`, and restoring the permissions restores both without a restart. Do not use key deactivation for this step: a conforming server cannot return a Deactivated key to Active, and may still decrypt with it.
+7. A migration from Transit and its rollback complete with `secrets re-wrap` reporting zero stale rows in each direction.
+8. A database dump restored against the same key reads back.
+9. The table above gains the product's row.
 
 ## Known Limits
 
 - Only the KMIP 1.4 wire protocol is spoken. A server that lists only 2.x versions is rejected at startup.
 - Only single-part AES-GCM with a server-generated IV and a separate authentication tag is used; other modes, client-supplied IVs, and additional authenticated data are not.
+- The client does not verify that the server generates a fresh IV for every `Encrypt`; that property comes from the server and is confirmed during qualification.
 - A `Get Attributes` response that includes an unrequested attribute of TTLV type Interval or Big Integer cannot be decoded. The client requests only the four attributes it needs, which real servers honor.
 - The provider does not fall back to another provider when the server is unreachable; availability is the KMIP deployment's responsibility.

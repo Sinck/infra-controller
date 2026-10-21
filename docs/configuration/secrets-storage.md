@@ -197,7 +197,7 @@ Rolling back writes is not symmetric. There is no export from Postgres to Vault.
 
 Rotation moves new writes immediately and existing entries on your schedule:
 
-1. **Route to the new key.** Add the new KEK to the active provider (every routed KEK must live there) and point the relevant `[secrets.routing]` entries at it. New writes wrap with it from the next boot; existing entries stay readable under the KEKs they recorded.
+1. **Add the new key, then route to it.** Add the new KEK to the active provider (every routed KEK must live there), restart, and wait for every old pod to terminate, so that each replica can unwrap under the new KEK before any replica writes with it: a pod from the previous rollout cannot read a row wrapped by a `kek_id` it does not know. Then point the relevant `[secrets.routing]` entries at the new KEK and restart again. New writes wrap with it from that boot; existing entries stay readable under the KEKs they recorded.
 2. **Re-wrap existing entries.** Run the walk after rotating:
 
    ```bash
