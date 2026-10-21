@@ -39,43 +39,46 @@ pub(super) struct RestIBFabric {
 const DEFAULT_INDEX0: bool = true;
 const DEFAULT_MEMBERSHIP: PortMembership = PortMembership::Full;
 
+/// How a UFM client authenticates, as resolved by [`auth_method`].
+#[derive(Clone)]
+pub(super) enum AuthMethod {
+    /// A bearer token.
+    Token(String),
+    /// Client-certificate files on disk.
+    Cert(UFMCert),
+}
+
 /// Detects the authentication method `auth` selects: a bearer token, or
 /// client-certificate files on disk. Certificate authentication is chosen for
 /// an empty `auth` string (the SPIFFE default paths) or one naming an existing
-/// path. The returned [`UFMCert`] paths are exactly what [`new_client`] loads
+/// path. The [`AuthMethod::Cert`] paths are exactly what [`new_client`] loads
 /// when given this result, so a caller resolves once, watches those paths for
 /// rotation, and builds from the same result.
-pub(super) fn auth_method(auth: &str) -> (Option<String>, Option<UFMCert>) {
+pub(super) fn auth_method(auth: &str) -> AuthMethod {
     if auth.trim().is_empty() {
-        (
-            None,
-            Some(UFMCert {
-                ca_crt: "/var/run/secrets/spiffe.io/ca.crt".to_string(),
-                tls_key: "/var/run/secrets/spiffe.io/tls.key".to_string(),
-                tls_crt: "/var/run/secrets/spiffe.io/tls.crt".to_string(),
-            }),
-        )
+        AuthMethod::Cert(UFMCert {
+            ca_crt: "/var/run/secrets/spiffe.io/ca.crt".to_string(),
+            tls_key: "/var/run/secrets/spiffe.io/tls.key".to_string(),
+            tls_crt: "/var/run/secrets/spiffe.io/tls.crt".to_string(),
+        })
     } else if Path::new(auth).exists() {
-        (
-            None,
-            Some(UFMCert {
-                ca_crt: format!("{auth}/ca.crt"),
-                tls_key: format!("{auth}/tls.key"),
-                tls_crt: format!("{auth}/tls.crt"),
-            }),
-        )
+        AuthMethod::Cert(UFMCert {
+            ca_crt: format!("{auth}/ca.crt"),
+            tls_key: format!("{auth}/tls.key"),
+            tls_crt: format!("{auth}/tls.crt"),
+        })
     } else {
-        (Some(auth.to_string()), None)
+        AuthMethod::Token(auth.to_string())
     }
 }
 
-/// Builds a client for the UFM at `addr` that authenticates with the `token`
-/// or `cert` that [`auth_method`] resolved.
-pub(super) fn new_client(
-    addr: &str,
-    token: Option<String>,
-    cert: Option<UFMCert>,
-) -> Result<Arc<dyn IBFabric>, IbError> {
+/// Builds a client for the UFM at `addr` that authenticates with `auth`, as
+/// [`auth_method`] resolved it.
+pub(super) fn new_client(addr: &str, auth: AuthMethod) -> Result<Arc<dyn IBFabric>, IbError> {
+    let (token, cert) = match auth {
+        AuthMethod::Token(token) => (Some(token), None),
+        AuthMethod::Cert(cert) => (None, Some(cert)),
+    };
     let conf = UFMConfig {
         address: addr.to_string(),
         username: None,
@@ -471,8 +474,7 @@ mod tests {
         });
         let client = new_client(
             &format!("http://{address}"),
-            Some("test-token".to_string()),
-            None,
+            AuthMethod::Token("test-token".to_string()),
         )
         .unwrap();
 

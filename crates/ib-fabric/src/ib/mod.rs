@@ -247,16 +247,19 @@ impl IBFabricManager for IBFabricManagerImpl {
                 // rather than replaced. A client built during such a gap uses
                 // the path as its token until the directory's files are newer
                 // than it or the credential changes.
-                let (token, cert) = rest::auth_method(&auth);
-                let tls_material: Vec<&Path> = cert
-                    .iter()
-                    .flat_map(|cert| [&cert.ca_crt, &cert.tls_key, &cert.tls_crt])
-                    .map(Path::new)
-                    .collect();
+                let auth_method = rest::auth_method(&auth);
+                let tls_material: Vec<&Path> = match &auth_method {
+                    rest::AuthMethod::Cert(cert) => vec![
+                        Path::new(&cert.ca_crt),
+                        Path::new(&cert.tls_key),
+                        Path::new(&cert.tls_crt),
+                    ],
+                    rest::AuthMethod::Token(_) => Vec::new(),
+                };
 
                 self.rest_clients
                     .get_or_build(fabric_name, fingerprint, &tls_material, || async {
-                        rest::new_client(endpoint, token, cert.clone())
+                        rest::new_client(endpoint, auth_method.clone())
                     })
                     .await
             }
