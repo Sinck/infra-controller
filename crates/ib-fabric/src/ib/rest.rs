@@ -434,6 +434,7 @@ impl From<PortMembership> for IBPortMembership {
 
 #[cfg(test)]
 mod tests {
+    use carbide_test_support::value_scenarios;
     use model::errors::ModelError;
     use opentelemetry::global;
     use ufm_mock::{
@@ -442,6 +443,30 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn auth_method_resolves_empty_and_missing_credentials() {
+        value_scenarios!(
+            run = |auth: &str| match auth_method(auth) {
+                AuthMethod::Token(token) => ("token", vec![token]),
+                AuthMethod::Cert(cert) => ("cert", vec![cert.ca_crt, cert.tls_key, cert.tls_crt]),
+            };
+            "an empty credential selects the SPIFFE default certificate files" {
+                "" => ("cert", vec![
+                    "/var/run/secrets/spiffe.io/ca.crt".to_string(),
+                    "/var/run/secrets/spiffe.io/tls.key".to_string(),
+                    "/var/run/secrets/spiffe.io/tls.crt".to_string(),
+                ]),
+            }
+
+            "a path that does not exist is a token" {
+                // A certificate directory missing mid-rotation resolves to a
+                // token, which the manager relies on to keep a cached client.
+                "/nonexistent/ufm-credentials" =>
+                    ("token", vec!["/nonexistent/ufm-credentials".to_string()]),
+            }
+        );
+    }
 
     #[tokio::test]
     async fn rest_client_is_compatible_with_the_ufm_mock() {
