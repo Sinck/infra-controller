@@ -6293,7 +6293,7 @@ fn dpu_network_not_ready_reason(
     // report so the individual DPU's report is used.
     dpu_health
         .has_classification(&health_report::HealthAlertClassification::prevent_host_state_changes())
-        .then_some("DPU agent health report has lifecycle-blocking alerts")
+        .then_some("check the DPU health alerts")
 }
 
 fn check_host_health_for_alerts(state: &ManagedHostStateSnapshot) -> Result<(), StateHandlerError> {
@@ -15077,7 +15077,7 @@ mod tests {
                 Check {
                     scenario: "agent report has a lifecycle-blocking alert",
                     input: (config_version(3), Some(Some(blocking_alert()))),
-                    expect: Some("DPU agent health report has lifecycle-blocking alerts"),
+                    expect: Some("check the DPU health alerts"),
                 },
                 Check {
                     scenario: "unsynced config is reported before a missing report",
