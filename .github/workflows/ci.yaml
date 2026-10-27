@@ -2182,6 +2182,9 @@ jobs:
       - name: Check Core VIP preflight
         run: /usr/bin/python3 -m unittest discover -s helm-prereqs/tests -p 'test_external_service_vips.py'
 
+      - name: Check KMIP provider preflight
+        run: /usr/bin/python3 -m unittest discover -s helm-prereqs/tests -p 'test_kmip_provider.py'
+
       # Uses python3-yaml installed by the configuration check above.
       - name: Test DevSpace bootstrap manifests
         run: /usr/bin/python3 -B dev/deployment/devspace/test_bootstrap_prereqs.py
@@ -2338,6 +2341,9 @@ jobs:
 
       - name: Test doca-platform pin
         run: bash helm-prereqs/tests/doca-platform-pin_test.sh
+
+      - name: Test KMIP client Secret
+        run: bash helm-prereqs/tests/setup-kmip-client-secret_test.sh
 
   build-push-helm-prereqs-chart:
     needs:
