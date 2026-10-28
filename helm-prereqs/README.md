@@ -458,6 +458,11 @@ two chart values, and a TOML block in the site config.
          readOnly: true
    ```
 
+   `defaultMode: 0400` keeps the client key readable by root only, the user
+   `nico-api` runs as in the release image and the chart. Remove it before
+   running `nico-api` as a non-root user: a root-owned `0400` file is
+   unreadable to any other user.
+
 3. **Declare the provider in the site config.** Add the `[secrets]` tables to
    `nico-api.siteConfig.nicoApiSiteConfig`, with the TLS paths under the mount
    above. Every field is described in
@@ -498,7 +503,8 @@ backed by a Secret, or a `NICO_KMIP_CLIENT_DIR` that no provider or mount uses,
 is a warning. The check parses the site TOML with Python's `tomllib` whenever
 the site config mentions KMIP, so such a site needs Python 3.11 or later, or
 the `tomli` package, in the `python3` environment that already provides PyYAML;
-without either, preflight warns that it could not look for a `kmip` provider.
+without either, preflight warns that it could not look for a `kmip` provider,
+or fails when `NICO_KMIP_CLIENT_DIR` is set, since that opt-in must be checked.
 
 Each `setup.sh` run is one `nico-api` rollout. A site that already stores
 credentials under Vault Transit keeps both providers configured and moves in

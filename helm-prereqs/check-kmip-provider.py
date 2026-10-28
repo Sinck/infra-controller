@@ -178,11 +178,18 @@ def check_kmip_provider(stream, managed_secret=False, lookup_secret=None):
     nico_api = _mapping(values.get("nico-api"), "nico-api")
     errors = []
     warnings = []
+    parser_missing = False
     try:
         providers = kmip_providers(nico_api)
     except ParserUnavailable as error:
         providers = {}
-        warnings.append(str(error))
+        parser_missing = True
+        if managed_secret:
+            # NICO_KMIP_CLIENT_DIR is an explicit opt-in, so a provider that cannot be checked is an error.
+            errors.append("the site config mentions KMIP and NICO_KMIP_CLIENT_DIR is set, but python3 has no TOML "
+                          "parser to check the kmip provider; install python3 3.11 or later, or the tomli package")
+        else:
+            warnings.append(str(error))
 
     if managed_secret:
         # setup.sh refuses to overwrite a Secret it does not own; catch that before Phase 1.
@@ -196,7 +203,7 @@ def check_kmip_provider(stream, managed_secret=False, lookup_secret=None):
                 errors.append(f"Secret {NAMESPACE}/{MANAGED_SECRET} exists but is not managed by setup.sh "
                               f"(its app.kubernetes.io/managed-by label is not {MANAGED_BY}); unset "
                               "NICO_KMIP_CLIENT_DIR to keep managing it yourself, or delete it so setup.sh can create it")
-        if not providers:
+        if not providers and not parser_missing:
             warnings.append("NICO_KMIP_CLIENT_DIR is set, but the site config has no [secrets.kms.providers.*] table "
                             f"with type = \"kmip\"; setup.sh still creates Secret {NAMESPACE}/{MANAGED_SECRET}")
     if not providers:

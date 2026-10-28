@@ -46,6 +46,8 @@ nico-api:
       readOnly: true
 ```
 
+`defaultMode: 0400` keeps the client key readable by root only, the user `nico-api` runs as in the release image and the chart. Remove it before running `nico-api` as a non-root user: a root-owned `0400` file is unreadable to any other user.
+
 ```bash
 kubectl -n nico-system create secret generic nico-kmip-client \
   --from-file=ca.pem=./kmip-ca.pem \

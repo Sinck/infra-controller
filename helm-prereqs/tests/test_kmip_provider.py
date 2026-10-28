@@ -193,22 +193,30 @@ class KmipProviderPreflightTest(unittest.TestCase):
             check_kmip_provider(io.StringIO(values("      # kmip\n      [secrets\n")), lookup_secret=None)
         self.assertIn("is not TOML", str(raised.exception))
 
-    def test_missing_parser_is_a_warning_not_an_error(self):
-        """Without tomllib or tomli the checker cannot tell whether a provider is declared, so it warns and goes on."""
+    def test_missing_parser_warns_unless_the_operator_opted_in(self):
+        """Without tomllib or tomli the checker cannot tell whether a provider is declared, so it warns and goes
+        on; with NICO_KMIP_CLIENT_DIR set the opt-in is explicit, and a provider it cannot check is an error."""
         saved = {name: sys.modules.get(name) for name in ("tomllib", "tomli")}
         sys.modules["tomllib"] = None
         sys.modules["tomli"] = None
         try:
-            errors, warnings = check_kmip_provider(io.StringIO(values("      # no kmip here\n")), lookup_secret=None)
+            for managed in (False, True):
+                with self.subTest(managed_secret=managed):
+                    errors, warnings = check_kmip_provider(
+                        io.StringIO(values("      # no kmip here\n")), managed_secret=managed,
+                        lookup_secret=lambda name: None)
+                    findings, silent = (errors, warnings) if managed else (warnings, errors)
+                    self.assertEqual(silent, [])
+                    self.assertEqual(len(findings), 1, (errors, warnings))
+                    self.assertIn("python3 3.11 or later, or the tomli package", findings[0])
+                    if managed:
+                        self.assertIn("NICO_KMIP_CLIENT_DIR is set", findings[0])
         finally:
             for name, module in saved.items():
                 if module is None:
                     sys.modules.pop(name, None)
                 else:
                     sys.modules[name] = module
-        self.assertEqual(errors, [])
-        self.assertEqual(len(warnings), 1, warnings)
-        self.assertIn("python3 3.11 or later, or the tomli package", warnings[0])
 
     def test_malformed_values_raise(self):
         cases = [
