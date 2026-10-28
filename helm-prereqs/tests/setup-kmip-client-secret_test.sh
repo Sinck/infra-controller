@@ -3,8 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # setup.sh creates the KMIP client TLS Secret from NICO_KMIP_CLIENT_DIR before
-# the Core deployment, refuses to touch a Secret it does not manage, and never
-# puts key material on a command line.
+# the Core deployment, refuses to touch a Secret it does not manage, replaces
+# only the Secret version it inspected, and never puts key material on a
+# command line.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,6 +57,11 @@ case "$*" in
     'get secret nico-kmip-client -n nico-system --ignore-not-found -o json')
         [[ "${FAKE_GET_FAILS:-false}" != "true" ]] || exit 1
         [[ ! -f "${TEST_SECRET_STATE}" ]] || cat "${TEST_SECRET_STATE}"
+        if [[ "${FAKE_CHANGE_AFTER_GET:-false}" == "true" && -f "${TEST_SECRET_STATE}" ]]; then
+            # Another writer updates the Secret right after setup.sh read it.
+            changed="$(jq '.metadata.resourceVersion = ((.metadata.resourceVersion | tonumber) + 1 | tostring)' "${TEST_SECRET_STATE}")"
+            printf '%s' "${changed}" > "${TEST_SECRET_STATE}"
+        fi
         ;;
     'create secret generic nico-kmip-client -n nico-system --from-file=ca.pem='*' --from-file=client.pem='*' --from-file=client.key='*' --dry-run=client -o json')
         # Render the Secret the way kubectl does: each key holds its file, base64-encoded.
@@ -80,7 +86,27 @@ case "$*" in
                 "${payload}" >&2
             exit 1
         fi
-        printf '%s' "${payload}" > "${TEST_SECRET_STATE}"
+        sent_version="$(jq -r '.metadata.resourceVersion // ""' <<< "${payload}")"
+        if [[ "${1}" == "create" ]]; then
+            if [[ -n "${sent_version}" ]]; then
+                echo 'Error from server (BadRequest): resourceVersion should not be set on objects to be created' >&2
+                exit 1
+            fi
+            stored_version=0
+        else
+            # Like the API server, honour the version in the manifest. A replacement
+            # without one would be unconditional: kubectl fetches the current version.
+            stored_version="$(jq -r '.metadata.resourceVersion' "${TEST_SECRET_STATE}")"
+            if [[ -z "${sent_version}" ]]; then
+                echo 'fake kubectl: replace without metadata.resourceVersion would be unconditional' >&2
+                exit 1
+            fi
+            if [[ "${sent_version}" != "${stored_version}" ]]; then
+                echo 'Error from server (Conflict): error when replacing "STDIN": Operation cannot be fulfilled on secrets "nico-kmip-client": the object has been modified; please apply your changes to the latest version and try again' >&2
+                exit 1
+            fi
+        fi
+        jq --arg rv "$((stored_version + 1))" '.metadata.resourceVersion = $rv' <<< "${payload}" > "${TEST_SECRET_STATE}"
         echo "secret/nico-kmip-client ${1}d"
         ;;
     *)
@@ -186,6 +212,22 @@ if ! grep -Fq 'could not replace Secret nico-system/nico-kmip-client' <<< "${rej
 fi
 if grep -Fq "${encoded_key}" <<< "${rejected_output}" || grep -Fq 'secret-key-material' <<< "${rejected_output}"; then
     echo "a rejected Secret write leaked key material into setup output" >&2
+    exit 1
+fi
+
+# A Secret that changes between the ownership check and the write is not
+# overwritten: the replacement names the inspected version, and the server's
+# conflict is reported with a hint to rerun.
+printf -- '-----BEGIN CERTIFICATE-----\nca-bundle-v3\n' > "${client_dir}/ca.pem"
+before_conflict="$(jq -c '.data' "${TEST_SECRET_STATE}")"
+if changed_output="$(FAKE_CHANGE_AFTER_GET=true _create_kmip_client_secret "${client_dir}" 2>&1)"; then
+    echo "setup overwrote a Secret that changed after it was inspected" >&2
+    exit 1
+fi
+if ! grep -Fq 'could not replace Secret nico-system/nico-kmip-client' <<< "${changed_output}" || \
+   ! grep -Fq 'rerun setup.sh to re-check it' <<< "${changed_output}" || \
+   [[ "$(jq -c '.data' "${TEST_SECRET_STATE}")" != "${before_conflict}" ]]; then
+    echo "a Secret changed after inspection was not reported as a conflict and left as it was" >&2
     exit 1
 fi
 

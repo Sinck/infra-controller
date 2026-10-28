@@ -646,6 +646,9 @@ _create_kmip_client_secret() {
     local _dir="$1"
     local _file=""
     local _existing=""
+    local _label=""
+    local _resource_version=""
+    local _tab=$'\t'
     local _verb="create"
     local _err_file=""
     local _from_file_args=()
@@ -663,19 +666,28 @@ _create_kmip_client_secret() {
         _from_file_args+=(--from-file="${_file}=${_dir}/${_file}")
     done
 
-    # Reduce the existing Secret to its ownership label inside the pipeline:
-    # a traced assignment of the whole object would print the base64 key under
-    # --debug. Absent Secret: empty output; present: "present<TAB><label>".
+    # Reduce the existing Secret to its ownership label and resource version
+    # inside the pipeline: a traced assignment of the whole object would print
+    # the base64 key under --debug. Absent Secret: empty output; present:
+    # "present<TAB><label><TAB><resourceVersion>".
     if ! _existing="$(kubectl get secret "${_KMIP_CLIENT_SECRET_NAME}" \
             -n nico-system --ignore-not-found -o json | \
-        jq -r '"present\t" + (.metadata.labels["app.kubernetes.io/managed-by"] // "")')"; then
+        jq -r '"present\t" + (.metadata.labels["app.kubernetes.io/managed-by"] // "") +
+            "\t" + (.metadata.resourceVersion // "")')"; then
         echo "Error: could not inspect Secret nico-system/${_KMIP_CLIENT_SECRET_NAME}." >&2
         return 1
     fi
     if [[ -n "${_existing}" ]]; then
-        if [[ "${_existing#*	}" != "helm-prereqs" ]]; then
+        _label="${_existing#*${_tab}}"
+        _resource_version="${_label#*${_tab}}"
+        _label="${_label%%${_tab}*}"
+        if [[ "${_label}" != "helm-prereqs" ]]; then
             echo "Error: Secret nico-system/${_KMIP_CLIENT_SECRET_NAME} exists but is not managed by setup.sh." >&2
             echo "  Unset NICO_KMIP_CLIENT_DIR to keep managing it yourself, or delete it so setup.sh can create it." >&2
+            return 1
+        fi
+        if [[ -z "${_resource_version}" ]]; then
+            echo "Error: could not inspect Secret nico-system/${_KMIP_CLIENT_SECRET_NAME}: it reports no resource version." >&2
             return 1
         fi
         echo "Updating Secret nico-system/${_KMIP_CLIENT_SECRET_NAME} from ${_dir}..."
@@ -686,6 +698,9 @@ _create_kmip_client_secret() {
     # command line or in --debug tracing. Create or replace rather than
     # apply: apply would copy the key into the last-applied-configuration
     # annotation and echoes the attempted patch when the server rejects it.
+    # A replacement carries the resource version inspected above, so the
+    # server answers with a conflict if the Secret changed in between; without
+    # it, kubectl would fetch the current version and overwrite the Secret.
     # kubectl's diagnostics are relayed minus any line carrying encoded data.
     if [[ -n "${_existing}" ]]; then
         _verb="replace"
@@ -693,10 +708,15 @@ _create_kmip_client_secret() {
     _err_file="$(mktemp -t nico-kmip-secret.XXXXXX)"
     if ! kubectl create secret generic "${_KMIP_CLIENT_SECRET_NAME}" \
             -n nico-system "${_from_file_args[@]}" --dry-run=client -o json | \
-        jq '.metadata.labels = ((.metadata.labels // {}) +
-            {"app.kubernetes.io/managed-by": "helm-prereqs"})' | \
+        jq --arg rv "${_resource_version}" \
+            '.metadata.labels = ((.metadata.labels // {}) +
+                {"app.kubernetes.io/managed-by": "helm-prereqs"})
+            | if $rv == "" then . else .metadata.resourceVersion = $rv end' | \
         kubectl "${_verb}" -f - 2>"${_err_file}"; then
         echo "Error: could not ${_verb} Secret nico-system/${_KMIP_CLIENT_SECRET_NAME}." >&2
+        if grep -q 'Conflict' "${_err_file}"; then
+            echo "  The Secret changed after setup.sh inspected it; rerun setup.sh to re-check it." >&2
+        fi
         grep -v -E '[A-Za-z0-9+/=]{64,}' "${_err_file}" | sed 's/^/  /' >&2 || true
         rm -f "${_err_file}"
         return 1
