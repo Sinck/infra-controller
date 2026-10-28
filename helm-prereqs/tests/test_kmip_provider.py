@@ -18,7 +18,7 @@ CHECKER = Path(__file__).resolve().parents[1] / "check-kmip-provider.py"
 _module = runpy.run_path(str(CHECKER))
 check_kmip_provider = _module["check_kmip_provider"]
 kubectl_secret = _module["kubectl_secret"]
-CHART_MOUNT_PATHS = _module["CHART_MOUNT_PATHS"]
+chart_mount_paths = _module["chart_mount_paths"]
 
 PROVIDER = """\
       [secrets.kms.providers.hsm]
@@ -82,6 +82,13 @@ class KmipProviderPreflightTest(unittest.TestCase):
              ["ca_bundle = '/etc/pki/ca.pem' is not under any nico-api.extraVolumeMounts mountPath or chart-provided mount"], []),
             ("the site CA under a chart-provided mount needs no extra volume",
              values(provider(ca="/var/run/secrets/nico-roots/ca.crt"), MOUNT, VOLUME), False, {"nico-kmip-client": ALL_KEYS}, [], []),
+            ("the boot-artifact store is a chart mount only while bootArtifactContainers is set",
+             values(provider(ca="/forge-boot-artifacts/blobs/internal/ca.pem"), MOUNT, VOLUME)
+             .replace("  siteConfig:", "  bootArtifactContainers:\n    - name: boot\n  siteConfig:"),
+             False, {"nico-kmip-client": ALL_KEYS}, [], []),
+            ("without bootArtifactContainers nothing mounts the boot-artifact store",
+             values(provider(ca="/forge-boot-artifacts/blobs/internal/ca.pem"), MOUNT, VOLUME), False, {"nico-kmip-client": ALL_KEYS},
+             ["ca_bundle = '/forge-boot-artifacts/blobs/internal/ca.pem' is not under any nico-api.extraVolumeMounts mountPath or chart-provided mount"], []),
             ("a chart mount below an enclosing extra mount serves the file",
              values(provider(ca="/var/run/secrets/nico-roots/ca.crt", cert="/var/run/secrets/kmip/client.pem",
                              key="/var/run/secrets/kmip/client.key"),
@@ -236,9 +243,10 @@ class KmipProviderPreflightTest(unittest.TestCase):
         template = (Path(__file__).resolve().parents[2] / "helm/charts/nico-api/templates/deployment.yaml").read_text()
         literal = {m.strip('"') for m in re.findall(r"mountPath:\s*(\S+)", template) if "{{" not in m}
         self.assertTrue(literal)
+        known = chart_mount_paths({"bootArtifactContainers": [{"name": "boot"}]})
         for path in sorted(literal):
-            self.assertTrue(any(path == chart or path.startswith(chart + "/") for chart in CHART_MOUNT_PATHS),
-                            f"{path} is rendered by the chart but missing from CHART_MOUNT_PATHS")
+            self.assertTrue(any(path == chart or path.startswith(chart + "/") for chart in known),
+                            f"{path} is rendered by the chart but unknown to chart_mount_paths")
 
     def test_kubectl_secret_lookup(self):
         """Map kubectl's outcomes onto keys and ownership, absence, and failure without a live cluster."""

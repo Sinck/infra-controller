@@ -80,6 +80,10 @@ case "$*" in
         ;;
     'create -f -'|'replace -f -')
         payload="$(cat)"
+        if [[ "${FAKE_WRITE_FAILS:-false}" == "client" ]]; then
+            echo 'Unable to connect to the server: dial tcp 192.0.2.10:6443: i/o timeout' >&2
+            exit 1
+        fi
         if [[ "${FAKE_WRITE_FAILS:-false}" == "true" ]]; then
             # A verbose server rejection that echoes the attempted object.
             printf 'Error from server (Invalid): error when replacing "STDIN": %s\nThe Secret "nico-kmip-client" is invalid: data: Forbidden: field is immutable when `immutable` is set\n' \
@@ -196,7 +200,8 @@ if ! grep -Fq 'exists but is not managed by setup.sh' <<< "${refusal_output}" ||
     exit 1
 fi
 
-# A rejected write is reported with kubectl's diagnostics, minus the echoed object.
+# A rejected write is reported with kubectl's reason code only: a rejected object
+# could carry the key, so kubectl's diagnostics are never relayed.
 jq '.metadata.labels = {"app.kubernetes.io/managed-by": "helm-prereqs"}' "${TEST_SECRET_STATE}" > "${TEST_TMP_DIR}/managed-secret.json"
 mv "${TEST_TMP_DIR}/managed-secret.json" "${TEST_SECRET_STATE}"
 before_rejection="$(sha256sum "${TEST_SECRET_STATE}")"
@@ -204,14 +209,27 @@ if rejected_output="$(FAKE_WRITE_FAILS=true _create_kmip_client_secret "${client
     echo "setup reported success although the server rejected the Secret" >&2
     exit 1
 fi
-if ! grep -Fq 'could not replace Secret nico-system/nico-kmip-client' <<< "${rejected_output}" || \
-   ! grep -Fq 'field is immutable' <<< "${rejected_output}" || \
+if ! grep -Fq 'could not replace Secret nico-system/nico-kmip-client (kubectl reported Invalid)' <<< "${rejected_output}" || \
    [[ "$(sha256sum "${TEST_SECRET_STATE}")" != "${before_rejection}" ]]; then
-    echo "a rejected Secret write was not reported with kubectl's diagnostics" >&2
+    echo "a rejected Secret write was not reported with kubectl's reason code" >&2
     exit 1
 fi
-if grep -Fq "${encoded_key}" <<< "${rejected_output}" || grep -Fq 'secret-key-material' <<< "${rejected_output}"; then
-    echo "a rejected Secret write leaked key material into setup output" >&2
+if grep -Fq 'field is immutable' <<< "${rejected_output}" || grep -Fq '"kind"' <<< "${rejected_output}" || \
+   grep -Fq "${encoded_key}" <<< "${rejected_output}" || grep -Fq 'secret-key-material' <<< "${rejected_output}"; then
+    echo "a rejected Secret write relayed kubectl's diagnostics or key material into setup output" >&2
+    exit 1
+fi
+
+# A failure before the server answers has no reason code; setup says that
+# kubectl's output is withheld and names the command that reproduces it.
+if client_output="$(FAKE_WRITE_FAILS=client _create_kmip_client_secret "${client_dir}" 2>&1)"; then
+    echo "setup reported success although kubectl could not reach the server" >&2
+    exit 1
+fi
+if ! grep -Fq 'could not replace Secret nico-system/nico-kmip-client.' <<< "${client_output}" || \
+   ! grep -Fq "its output is withheld because a rejected object could carry the key. Run 'kubectl -n nico-system get secret nico-kmip-client'" <<< "${client_output}" || \
+   grep -Fq 'i/o timeout' <<< "${client_output}"; then
+    echo "a client-side kubectl failure was not reported with the reproduction hint only" >&2
     exit 1
 fi
 
@@ -224,7 +242,7 @@ if changed_output="$(FAKE_CHANGE_AFTER_GET=true _create_kmip_client_secret "${cl
     echo "setup overwrote a Secret that changed after it was inspected" >&2
     exit 1
 fi
-if ! grep -Fq 'could not replace Secret nico-system/nico-kmip-client' <<< "${changed_output}" || \
+if ! grep -Fq 'could not replace Secret nico-system/nico-kmip-client (kubectl reported Conflict)' <<< "${changed_output}" || \
    ! grep -Fq 'rerun setup.sh to re-check it' <<< "${changed_output}" || \
    [[ "$(jq -c '.data' "${TEST_SECRET_STATE}")" != "${before_conflict}" ]]; then
     echo "a Secret changed after inspection was not reported as a conflict and left as it was" >&2

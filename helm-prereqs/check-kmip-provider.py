@@ -31,8 +31,9 @@ CHART_MOUNT_PATHS = (
     "/var/run/secrets/nico-roots",
     "/opt/carbide/firmware",
     "/opt/nico/firmware",
-    "/forge-boot-artifacts/blobs/internal",
 )
+# Rendered only when nico-api.bootArtifactContainers is non-empty, like the template's own test.
+BOOT_ARTIFACTS_MOUNT = "/forge-boot-artifacts/blobs/internal"
 # Chart mounts whose path comes from the values, with the chart's defaults.
 NVSWITCH_CLIENT_MOUNT_DEFAULT = "/var/run/secrets/nvswitch-client"
 CREDENTIAL_FILE_MOUNT_DEFAULT = "/var/run/secrets/nico/credentials"
@@ -113,6 +114,8 @@ def deepest_chart_mount(path, chart_mounts):
 def chart_mount_paths(nico_api):
     """Return the mount paths the chart renders for nico-api from its templates and these values."""
     paths = list(CHART_MOUNT_PATHS)
+    if nico_api.get("bootArtifactContainers"):
+        paths.append(BOOT_ARTIFACTS_MOUNT)
     nvswitch = _mapping(_mapping(nico_api.get("nvSwitchTls"), "nico-api.nvSwitchTls").get("nicoClient"),
                         "nico-api.nvSwitchTls.nicoClient")
     if nvswitch.get("enabled") is not False:

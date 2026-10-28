@@ -651,6 +651,7 @@ _create_kmip_client_secret() {
     local _tab=$'\t'
     local _verb="create"
     local _err_file=""
+    local _reason=""
     local _from_file_args=()
 
     if [[ ! -d "${_dir}" ]]; then
@@ -701,7 +702,8 @@ _create_kmip_client_secret() {
     # A replacement carries the resource version inspected above, so the
     # server answers with a conflict if the Secret changed in between; without
     # it, kubectl would fetch the current version and overwrite the Secret.
-    # kubectl's diagnostics are relayed minus any line carrying encoded data.
+    # kubectl's diagnostics are not relayed, since a rejected object could
+    # carry the key; only the server's reason code is reported.
     if [[ -n "${_existing}" ]]; then
         _verb="replace"
     fi
@@ -713,12 +715,14 @@ _create_kmip_client_secret() {
                 {"app.kubernetes.io/managed-by": "helm-prereqs"})
             | if $rv == "" then . else .metadata.resourceVersion = $rv end' | \
         kubectl "${_verb}" -f - 2>"${_err_file}"; then
-        echo "Error: could not ${_verb} Secret nico-system/${_KMIP_CLIENT_SECRET_NAME}." >&2
-        if grep -q 'Conflict' "${_err_file}"; then
-            echo "  The Secret changed after setup.sh inspected it; rerun setup.sh to re-check it." >&2
-        fi
-        grep -v -E '[A-Za-z0-9+/=]{64,}' "${_err_file}" | sed 's/^/  /' >&2 || true
+        _reason="$(sed -n -E 's/^Error from server \(([A-Za-z]+)\).*/\1/p' "${_err_file}" | head -n 1)"
         rm -f "${_err_file}"
+        echo "Error: could not ${_verb} Secret nico-system/${_KMIP_CLIENT_SECRET_NAME}${_reason:+ (kubectl reported ${_reason})}." >&2
+        if [[ "${_reason}" == "Conflict" ]]; then
+            echo "  The Secret changed after setup.sh inspected it; rerun setup.sh to re-check it." >&2
+        elif [[ -z "${_reason}" ]]; then
+            echo "  kubectl failed without a server reason; its output is withheld because a rejected object could carry the key. Run 'kubectl -n nico-system get secret ${_KMIP_CLIENT_SECRET_NAME}' to check cluster access." >&2
+        fi
         return 1
     fi
     rm -f "${_err_file}"
