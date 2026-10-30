@@ -429,7 +429,7 @@ two chart values, and a TOML block in the site config.
    export NICO_KMIP_CLIENT_DIR=/path/to/kmip-client   # holds ca.pem, client.pem, client.key
    ```
 
-   When you confirm the Core deployment (at once with `-y`), and before Phase 6
+   When you confirm the Core deployment (or immediately, with `-y`), and before Phase 6
    installs it, `setup.sh` creates the Secret `nico-kmip-client` in
    `nico-system` from the three files and labels it
    `app.kubernetes.io/managed-by: helm-prereqs`. A declined deployment leaves

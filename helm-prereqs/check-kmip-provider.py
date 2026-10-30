@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Check that a KMIP KEK provider in the Core values reads its TLS files from a mounted Secret that exists."""
+"""Check that a KMIP KEK provider in the Core values reads its TLS files from a chart mount or a mounted Secret that exists."""
 
 import json
 import posixpath

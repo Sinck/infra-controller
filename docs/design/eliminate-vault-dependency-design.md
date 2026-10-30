@@ -628,7 +628,7 @@ The overall effort is complete when a supported site can:
    Kubernetes-resource abstraction are selected; request naming, cleanup, and
    retry mechanics remain implementation details.
    [#5956](https://github.com/dsx-ai-factory/infra-controller/issues/5956)
-   closed when the opt-in provider merged
+   closed after the opt-in provider merged
    ([#7283](https://github.com/dsx-ai-factory/infra-controller/pull/7283))
    without recording this validation decision, and no issue tracks it as of
    the section 8 snapshot.
@@ -652,7 +652,7 @@ the end-state design and remain independent of implementation order. Phase 1
 ([#195](https://github.com/dsx-ai-factory/infra-controller/issues/195)) implementation
 is complete, and the design issue for this document
 ([#3251](https://github.com/dsx-ai-factory/infra-controller/issues/3251)) closed
-when the document merged. The Phase 2 epic
+after the document merged. The Phase 2 epic
 ([#5199](https://github.com/dsx-ai-factory/infra-controller/issues/5199)) is closed.
 Under Phase 3
 ([#5200](https://github.com/dsx-ai-factory/infra-controller/issues/5200)), the
