@@ -981,7 +981,10 @@ async fn is_import_complete(db_pool: &PgPool) -> eyre::Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+
     use carbide_secrets::credentials::{CredentialKey, Credentials};
+    use serial_test::serial;
 
     use super::*;
 
@@ -1110,15 +1113,52 @@ mod tests {
         );
     }
 
+    /// Restores an environment variable's prior value when dropped.
+    struct EnvironmentVariableGuard {
+        name: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvironmentVariableGuard {
+        /// Removes an environment variable and records its prior value.
+        fn remove(name: &'static str) -> Self {
+            let previous = std::env::var_os(name);
+            if previous.is_some() {
+                // SAFETY: callers mark tests `#[serial]` to avoid concurrent
+                // reads or mutations of this process-wide state.
+                unsafe {
+                    std::env::remove_var(name);
+                }
+            }
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvironmentVariableGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                // SAFETY: this restores the value `remove` cleared in a
+                // `#[serial]` test, including while unwinding from a panic.
+                unsafe {
+                    std::env::set_var(self.name, value);
+                }
+            }
+        }
+    }
+
     // The zero acquire timeout fails the database step without touching the
     // network, and the shared Vault's CA file is missing, so each error shows
     // which check ran first: a site that names no shared Vault gets past the
     // Vault settings it lacks, and `import_from = "vault"` fails on them before
-    // the database could report a completed import.
+    // the database could report a completed import. The CA lookup falls back to
+    // `VAULT_CACERT`, so the test clears it; otherwise a shell with the other
+    // `VAULT_*` variables set would build the client.
     #[tokio::test]
+    #[serial]
     async fn startup_checks_shared_vault_settings_only_when_named() {
         use CredentialBackend::Postgres;
 
+        let _vault_cacert = EnvironmentVariableGuard::remove("VAULT_CACERT");
         let certificate_vault_ca =
             tempfile::NamedTempFile::new().expect("create the certificate vault CA file");
         let dedicated_vault = carbide_api_core::cfg::file::DedicatedVaultSettings {
