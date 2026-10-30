@@ -79,8 +79,8 @@ def _parse_toml(text):
 def kmip_providers(nico_api):
     """Return every [secrets.kms.providers.*] table with type = "kmip" in the rendered site TOML."""
     site_config = _mapping(nico_api.get("siteConfig"), "nico-api.siteConfig")
-    # The chart renders the TOML unless siteConfig.enabled is the Boolean false.
-    if site_config.get("enabled") is False:
+    # The chart renders the TOML under `if .Values.siteConfig.enabled`, which defaults to true.
+    if not _helm_enabled(site_config, "enabled", True):
         return {}
     text = site_config.get("nicoApiSiteConfig")
     if text is None or text == "":
@@ -105,6 +105,14 @@ def _is_under(path, directory):
     return relative not in (".", "..") and not relative.startswith("../")
 
 
+def _helm_enabled(mapping, key, default):
+    """Evaluate a values flag the way a template's `if` does: an absent key keeps the chart default,
+    and a present one is false when it is false, null, 0, or an empty string, list, or map."""
+    if key not in mapping:
+        return default
+    return bool(mapping[key])
+
+
 def deepest_chart_mount(path, chart_mounts):
     """Return the longest chart-provided mount path above `path`, or None."""
     above = [posixpath.normpath(m) for m in chart_mounts if _is_under(path, m)]
@@ -118,7 +126,9 @@ def chart_mount_paths(nico_api):
         paths.append(BOOT_ARTIFACTS_MOUNT)
     nvswitch = _mapping(_mapping(nico_api.get("nvSwitchTls"), "nico-api.nvSwitchTls").get("nicoClient"),
                         "nico-api.nvSwitchTls.nicoClient")
-    if nvswitch.get("enabled") is not False:
+    # The template renders this mount under `if .Values.nvSwitchTls.nicoClient.enabled`, which
+    # defaults to true in the chart.
+    if _helm_enabled(nvswitch, "enabled", True):
         paths.append(str(nvswitch.get("mountPath") or NVSWITCH_CLIENT_MOUNT_DEFAULT))
     credential_file = _mapping(_mapping(nico_api.get("credentials"), "nico-api.credentials").get("file"),
                                "nico-api.credentials.file")

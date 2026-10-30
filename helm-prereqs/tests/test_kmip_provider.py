@@ -89,6 +89,13 @@ class KmipProviderPreflightTest(unittest.TestCase):
             ("without bootArtifactContainers nothing mounts the boot-artifact store",
              values(provider(ca="/forge-boot-artifacts/blobs/internal/ca.pem"), MOUNT, VOLUME), False, {"nico-kmip-client": ALL_KEYS},
              ["ca_bundle = '/forge-boot-artifacts/blobs/internal/ca.pem' is not under any nico-api.extraVolumeMounts mountPath or chart-provided mount"], []),
+            ("the NVSwitch client mount is chart-provided by default",
+             values(provider(ca="/var/run/secrets/nvswitch-client/ca.crt"), MOUNT, VOLUME), False, {"nico-kmip-client": ALL_KEYS}, [], []),
+            ("a null nvSwitchTls.nicoClient.enabled omits the mount, as Helm's if does",
+             values(provider(ca="/var/run/secrets/nvswitch-client/ca.crt"), MOUNT, VOLUME)
+             .replace("  siteConfig:", "  nvSwitchTls:\n    nicoClient:\n      enabled: null\n  siteConfig:"),
+             False, {"nico-kmip-client": ALL_KEYS},
+             ["ca_bundle = '/var/run/secrets/nvswitch-client/ca.crt' is not under any nico-api.extraVolumeMounts mountPath or chart-provided mount"], []),
             ("a chart mount below an enclosing extra mount serves the file",
              values(provider(ca="/var/run/secrets/nico-roots/ca.crt", cert="/var/run/secrets/kmip/client.pem",
                              key="/var/run/secrets/kmip/client.key"),
@@ -166,6 +173,8 @@ class KmipProviderPreflightTest(unittest.TestCase):
              [], ["comes from volume 'kmip-client' of kind hostPath, not a Secret"]),
             ("siteConfig.enabled false renders no TOML",
              values(provider(), MOUNT, VOLUME, site_enabled="false"), False, {}, [], []),
+            ("siteConfig.enabled null renders no TOML either",
+             values(provider(), MOUNT, VOLUME, site_enabled="null"), False, {}, [], []),
         ]
         for name, text, managed, secrets, want_errors, want_warnings in cases:
             with self.subTest(name):
